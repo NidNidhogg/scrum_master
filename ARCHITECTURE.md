@@ -1,83 +1,78 @@
-# ARCHITECTURE.md: AI Scrum Master (V1.2)
+# 🏛 AI Scrum Master: System Architecture
 
-## 1. System Vision & Philosophy
-* **Product Goal:** Automation of team intraday task status monitoring with active facilitation (Handshake) and SLA control.
-* **Architecture Style:** Lean Code (minimum infrastructure, maximum reuse of LLM logic).
-* **Environment:** Core development is conducted in an IDE with AI agents (Antigravity). The code must be modular and predictable.
-* **Tech Stack:** Python 3.11+, Telegram API (`aiogram` 3.x), Database (`SQLAlchemy` 2.0, `aiosqlite` -> `asyncpg`), LLM (`Google Gemini API`).
+This document outlines the core architecture, data flows, and design decisions of the AI Scrum Master bot.
 
 ---
 
-## 2. Core Business Workflows
+## 1. Core Philosophy
+The bot acts as a specialized assistant that bridges the gap between raw meeting discussions and structured developer plans. It utilizes **Google Gemini** for high-reasoning parsing while maintaining a strict, Lead-controlled workflow.
 
-The system operates as a Finite State Machine (FSM) around the `DailyContract` entity.
+---
 
-### Flow 1: Ingestion & Smart Parsing (Morning)
-1.  **Trigger:** The Lead uploads a Markdown summary (from a transcriber) into the bot's direct messages (DM).
-2.  **Processing:** The LLM agent (via Tool Use `BatchCreateContracts`) parses the text. It extracts:
-    * Developer Names/Aliases.
-    * General discussion context (`meeting_context`).
-    * Tasks (`description`) and their estimates (`time_estimate`).
-3.  **Entity Resolution:** The bot maps raw names to `tg_id` from the `user_aliases` table. In case of connection drops and multiple summary uploads, the bot operates in **Append Mode** (adding tasks to the existing daily plan).
-4.  **State:** Tasks are saved in the DB with a `draft` status.
+## 2. System Flows
 
-### Flow 2: The Handshake (Two-way Approval)
-1.  The bot distributes the daily plan (Draft) to developers via DMs or by tagging them in the group.
-2.  The UI provides two Inline buttons: `[Approve]` and `[Edit]`.
-3.  **On Approval:** The contract status changes to `active`, and `started_at` is recorded (starting the SLA timer).
-4.  **On Edit:** `aiogram FSM` is triggered. The user writes their task variant in text -> LLM updates the DB -> status changes to `active` -> The Lead receives a notification about the change.
+### Flow 1: Ingestion & Smart Parsing (The Clean Slate)
+- **Ruthless Cleanup**: Before re-parsing a date, the system performs an explicit two-step deletion: first deleting all child `Task` rows, then their parent `DailyContract` rows. This guarantees a clean slate and mitigates SQLite's default foreign key cascade limitations.
+- **Smart Identity Resolution**: Ingestion logic uses a hierarchy (Alias -> Full Name -> Username) across ALL users (not just developers) to link tasks.
+- **Dumb Extractor & Field Separation**:
+    - **Inclusive Extractor**: EVERY non-empty line under a developer's header is captured as a task, even without bullet points or dashes.
+    - **Field Separation**: The LLM strictly separates the `description` (action only, verbatim) from the `time_estimate` (designation for brackets like `[Сегодня]`, deadlines, or durations).
 
-### Flow 3: Active Monitoring & SLA (Daytime)
-We abandon the strict 14:00 timer in favor of dynamic checks:
-1.  **The "Missing Persons" Radar (11:00):** Cron checks all users with the `is_active=True` flag. If someone doesn't have a `DailyContract` for today, the Lead receives an alert.
-2.  **SLA Monitor (Every 30 mins):** Cron checks tasks in the `in_progress` status.
-    * *Condition:* `(Current Time - started_at) >= 4 hours` AND `sla_ping_sent == False`.
-    * *Action:* The LLM generates a contextual question (considering the original `time_estimate` and task essence) and pings the developer.
-    * After sending, the `sla_ping_sent = True` flag is set.
-3.  **Response Processing:** The developer replies in plain text. The LLM, via the `update_task_status` Tool, transitions the task to `done` or `blocked` (filling in the `blocker_note`).
+### Flow 2: The Handshake (Developer Check-in)
+- **Activation Block**: Plans are sent to developers as `drafts`. A plan only becomes `active` once the developer approves it, starting the SLA monitor.
+- **Simple Forward (The Pivot)**: If a developer proposes changes via the `✏️ Edit` button, the bot captures their verbatim text and forwards it directly to the Lead's DM for manual review. 
+    - The database is **NOT** automatically updated by the AI.
+    - The contract remains as a `draft`.
+    - The Lead must manually apply the changes via the **Edit Drafts** menu if approved.
 
-### Flow 4: Evening Synthesis (18:00)
-1.  The bot extracts the day's data: `DailyContract`, `Tasks`, `IntradayUpdates`.
-2.  The LLM aggregates an Executive Summary: closed tasks, carry-over tasks, critical blockers.
-3.  The report is sent to the Lead.
+### Flow 3: SLA & Active Monitoring
+- **Radar**: Every morning (11:00), the bot checks for developers who haven't approved their plans.
+- **Ping**: Every 30 minutes, it monitors active plans for un-updated tasks (no status changes for >4 hours).
 
 ---
 
 ## 3. Database Schema Design (SQLAlchemy 2.0)
 
-Implementation strictly via `DeclarativeBase` and `Mapped` types.
+### `users`
+- `tg_id`: BigInteger (Unique Index)
+- `role`: Enum (Lead, Developer)
+- `notification_chat_id`: For asynchronous DMs.
 
-* **`users`**: Basic info. Fields: `tg_id` (Unique), `role`, `is_active` (Boolean), `notification_chat_id`.
-* **`user_aliases`**: For transcript Entity Resolution. Field `alias` (String). ON DELETE CASCADE relationship with `users`.
-* **`daily_contracts`**: One-day plan.
-    * Fields: `target_date`, `meeting_context` (Text), `status` (Enum: `draft`, `active`, `completed`).
-    * SLA Fields: `started_at` (DateTime), `sla_ping_sent` (Boolean).
-* **`tasks`**: Contract decomposition.
-    * Fields: `description`, `time_estimate` (String), `status` (Enum: `todo`, `in_progress`, `done`, `blocked`), `blocker_note`.
-* **`intraday_updates`**: Log of raw text messages from users.
+### `user_aliases`
+- `user_id`: ForeignKey(users.id)
+- `alias`: Unique string (e.g., "Dmitriy", "Dimas").
+
+### `daily_contracts`
+- `user_id`: ForeignKey(users.id, nullable=True) — Resolved developer.
+- `lead_id`: ForeignKey(users.id) — **Sprint Ownership**. Identifies which Scrum Master initiated the contract, supporting shifts and multiple leads.
+- `developer_alias`: Original string used in parsing (fallback).
+- `status`: Enum (Draft, Active, Completed).
+- `target_date`: Date of the tasks.
+
+### `tasks`
+- `contract_id`: ForeignKey(daily_contracts.id)
+- `description`: Verbatim task action.
+- `time_estimate`: Metadata bucket (estimates, bracketed info).
+- `status`: Enum (Todo, In-progress, Done, Blocked).
 
 ---
 
-## 4. Module Structure (Antigravity Target Structure)
+## 4. Module Structure
 
-```text
-/scrum_master_bot
-├── ARCHITECTURE.md          # This manifesto
-├── .env                     # Configuration (TG_TOKEN, ANTHROPIC_API_KEY, DB_URL)
-├── bot/
-│   ├── main.py              # Entry point (Bot, routers, DB initialization)
-│   ├── handlers/            # aiogram Routers
-│   │   ├── admin.py         # Receiving summary from Lead
-│   │   ├── dev_actions.py   # Handshake (Approve/Edit), ping responses
-│   ├── middlewares/         # Dependency Injection (DB session passing)
-├── db/
-│   ├── database.py          # SQLAlchemy AsyncEngine and sessionmaker
-│   ├── models.py            # Declarative entity models
-│   ├── repository.py        # SQL query isolation (Data Access Layer)
-├── agent/
-│   ├── core.py              # Anthropic API integration
-│   ├── prompts.py           # System prompts (Ingestion, SLA Ping, Synthesis)
-│   ├── tools.py             # Pydantic schemas for Tool Use
-├── worker/
-│   ├── scheduler.py         # APScheduler/Celery for crons (SLA, Radar, Synthesis)
-```
+- **`bot/`**: Telegram interface (Aiogram 3).
+    - `handlers/admin.py`: Lead controls, atomic ingestion logic.
+    - `handlers/dev_actions.py`: Developer Handshake and SLA responses.
+- **`agent/`**: LLM bridge (Google Gemini API).
+    - `core.py`: Gemini API integration with tool calling.
+    - `prompts.py`: Strategic instructions for high-fidelity extraction.
+- **`db/`**: Persistence layer.
+    - `repository.py`: Atomic I/O and identity resolution.
+- **`.env`**:
+    - `GEMINI_API_KEY`: Required for parsing and synthesis.
+    - `LEAD_TG_ID`: Primary system administrator.
+
+---
+
+## 5. Deployment Info
+- **Tech Stack**: Python 3.13, Aiogram 3.15, SQLAlchemy 2.0, APScheduler.
+- **Persistence**: SQLite (local) or PostgreSQL (production).

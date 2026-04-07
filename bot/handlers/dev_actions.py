@@ -141,6 +141,7 @@ async def handle_edit_text(
     data = await state.get_data()
     contract_id: int = data["contract_id"]
 
+    # Fetch contract to get user's name
     from sqlalchemy import select
     from db.models import DailyContract
     from sqlalchemy.orm import selectinload
@@ -148,45 +149,33 @@ async def handle_edit_text(
     result = await session.execute(
         select(DailyContract)
         .where(DailyContract.id == contract_id)
-        .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+        .options(selectinload(DailyContract.user))
     )
     contract = result.scalar_one_or_none()
+    
     if not contract:
         await message.reply("Contract not found.")
         await state.clear()
         return
 
-    original = " | ".join(t.description for t in contract.tasks)
-    rewritten = await agent.rewrite_task_edit(original, message.text or "")
+    developer_name = contract.user.full_name or contract.user.username or f"User {contract.user.tg_id}"
+    proposed_text = message.text or "[No text provided]"
 
-    # Update all tasks description (simplified: update first task; extend for multi-task)
-    if contract.tasks:
-        from sqlalchemy import update
-        from db.models import Task
-        await session.execute(
-            update(Task)
-            .where(Task.contract_id == contract_id)
-            .values(description=rewritten)
-        )
-
-    await repo.activate_contract(session, contract_id)
-
-    # Mark all tasks in_progress
-    for task in contract.tasks:
-        await repo.update_task_status(session, task.id, TaskStatus.in_progress)
-
-    await state.clear()
-    await message.reply(
-        f"✅ Updated & approved!\n\n📝 New task: {rewritten}"
-    )
-
-    # Lead notification
+    # [1] Forward to Lead exactly as requested
     if LEAD_TG_ID:
-        name = contract.user.full_name or contract.user.username or str(contract.user.tg_id)
-        await bot.send_message(
-            LEAD_TG_ID,
-            f"✏️ {name} edited their daily plan:\n\n{rewritten}",
+        forward_msg = (
+            f"⚠️ {developer_name} proposes changes to their plan:\n\n"
+            f"{proposed_text}\n\n"
+            f"(Please update the plan manually via the Edit Drafts menu if you approve)."
         )
+        try:
+            await bot.send_message(LEAD_TG_ID, forward_msg)
+        except Exception:
+            logger.exception("Failed to notify lead about proposed edit")
+
+    # [2] Clear state and reply to developer
+    await state.clear()
+    await message.reply("✅ Your proposed changes have been sent to the Lead for review.")
 
 
 # ──────────────────────────────────────────────

@@ -56,7 +56,10 @@ async def verify_db_state() -> None:
             print(f"(!) No contracts found for today ({target_date}).")
         else:
             for contract in contracts:
-                user_name = contract.user.full_name or contract.user.username or f"#{contract.user.tg_id}"
+                if contract.user:
+                    user_name = contract.user.full_name or contract.user.username or f"#{contract.user.tg_id}"
+                else:
+                    user_name = f"{contract.developer_alias or 'Unknown'} (Unresolved)"
                 print(f"Developer: {user_name}")
                 print(f"  Status: {contract.status.value}")
                 print(f"  Context: {(contract.meeting_context or 'None')[:80]}...")

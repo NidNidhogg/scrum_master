@@ -100,9 +100,13 @@ class DailyContract(Base):
     __tablename__ = "daily_contracts"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    lead_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    developer_alias: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     target_date: Mapped[date] = mapped_column(nullable=False, index=True)
     meeting_context: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[ContractStatus] = mapped_column(

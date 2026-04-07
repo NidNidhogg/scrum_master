@@ -17,7 +17,10 @@ class TaskInput(BaseModel):
     developer_alias: str = Field(
         ..., description="Name or alias of the developer."
     )
-    description: str = Field(..., description="Task description extracted from the transcript.")
+    description: str = Field(
+        ..., 
+        description="The EXACT, verbatim task description. You MUST copy the text character-for-character from the input, including all brackets, custom time estimates, and symbols. DO NOT summarize."
+    )
     time_estimate: Optional[str] = Field(
         None, description="Estimated duration, e.g. '2h', '30 min'. Null if not mentioned."
     )

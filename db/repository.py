@@ -32,6 +32,13 @@ async def get_user_by_tg_id(session: AsyncSession, tg_id: int) -> Optional[User]
     return result.scalar_one_or_none()
 
 
+async def get_user_by_username(session: AsyncSession, username: str) -> Optional[User]:
+    result = await session.execute(
+        select(User).where(User.username.ilike(username.strip().lstrip("@")))
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_or_create_user(
     session: AsyncSession,
     tg_id: int,
@@ -69,6 +76,12 @@ async def get_active_developers(session: AsyncSession) -> Sequence[User]:
     return result.scalars().all()
 
 
+async def get_all_users(session: AsyncSession) -> Sequence[User]:
+    """Fetches all registered users, including Leads."""
+    result = await session.execute(select(User))
+    return result.scalars().all()
+
+
 # ──────────────────────────────────────────────
 # Alias resolution (Entity Resolution)
 # ──────────────────────────────────────────────
@@ -84,11 +97,19 @@ async def resolve_alias(session: AsyncSession, alias: str) -> Optional[User]:
     return row.user if row else None
 
 
-async def add_alias(session: AsyncSession, user_id: int, alias: str) -> UserAlias:
-    obj = UserAlias(user_id=user_id, alias=alias.strip().lower())
-    session.add(obj)
-    await session.flush()
-    return obj
+async def add_alias(session: AsyncSession, user_id: int, alias: str) -> Optional[UserAlias]:
+    from sqlalchemy.exc import IntegrityError
+    try:
+        obj = UserAlias(user_id=user_id, alias=alias.strip().lower())
+        session.add(obj)
+        await session.flush()
+        return obj
+    except IntegrityError:
+        # Alias already exists, potentially for another user or the same one.
+        # We rollback the specific savepoint (implicitly handled by session.rollback if needed,
+        # but here we just return None to let the handler know).
+        await session.rollback()
+        return None
 
 
 async def get_all_aliases(session: AsyncSession) -> Sequence[UserAlias]:
@@ -103,32 +124,58 @@ async def get_all_aliases(session: AsyncSession) -> Sequence[UserAlias]:
 # ──────────────────────────────────────────────
 
 async def get_contract_today(
-    session: AsyncSession, user_id: int, target_date: Optional[date] = None
+    session: AsyncSession, 
+    user_id: Optional[int] = None, 
+    developer_alias: Optional[str] = None,
+    target_date: Optional[date] = None
 ) -> Optional[DailyContract]:
     target_date = target_date or date.today()
-    result = await session.execute(
-        select(DailyContract)
-        .where(DailyContract.user_id == user_id, DailyContract.target_date == target_date)
-        .options(selectinload(DailyContract.tasks))
-    )
+    query = select(DailyContract).where(DailyContract.target_date == target_date)
+    
+    if user_id:
+        query = query.where(DailyContract.user_id == user_id)
+    elif developer_alias:
+        query = query.where(DailyContract.developer_alias == developer_alias)
+    else:
+        return None
+        
+    result = await session.execute(query.options(selectinload(DailyContract.tasks)))
     return result.scalar_one_or_none()
 
 
 async def get_or_create_contract(
     session: AsyncSession,
-    user_id: int,
+    user_id: Optional[int] = None,
+    developer_alias: Optional[str] = None,
     target_date: Optional[date] = None,
     meeting_context: Optional[str] = None,
+    lead_tg_id: Optional[int] = None,
 ) -> tuple[DailyContract, bool]:
-    """Append Mode: returns existing contract if present."""
+    """Returns (contract, created)."""
     target_date = target_date or date.today()
-    contract = await get_contract_today(session, user_id, target_date)
+    contract = await get_contract_today(
+        session, user_id=user_id, developer_alias=developer_alias, target_date=target_date
+    )
+    
+    lead_user = None
+    if lead_tg_id:
+        lead_user = await get_user_by_tg_id(session, lead_tg_id)
+
     if contract:
         if meeting_context and not contract.meeting_context:
             contract.meeting_context = meeting_context
+        # Update user_id if it was NULL but now we have one
+        if user_id and not contract.user_id:
+            contract.user_id = user_id
+        # Link Lead if not already linked
+        if lead_user and not contract.lead_id:
+            contract.lead_id = lead_user.id
         return contract, False
+        
     contract = DailyContract(
         user_id=user_id,
+        lead_id=lead_user.id if lead_user else None,
+        developer_alias=developer_alias,
         target_date=target_date,
         meeting_context=meeting_context,
         status=ContractStatus.draft,
@@ -188,28 +235,32 @@ async def discard_daily_plans(
     session: AsyncSession, target_date: Optional[date] = None
 ) -> int:
     """
-    Deletes all 'draft' contracts for a given date.
+    RUTHLESS CLEANUP: Explicitly deletes child Tasks first, then Contracts for a date.
+    SQLite does not reliably cascade deletes unless PRAGMA foreign_keys=ON is set.
     Returns count of deleted contracts.
     """
     from sqlalchemy import delete
     target_date = target_date or date.today()
     
-    # We need to fetch count first or rely on rowcount
+    # 1. Get all contract IDs for this date
     result = await session.execute(
-        select(DailyContract).where(
-            DailyContract.target_date == target_date,
-            DailyContract.status == ContractStatus.draft,
-        )
+        select(DailyContract.id).where(DailyContract.target_date == target_date)
     )
-    count = len(result.scalars().all())
+    contract_ids = [row[0] for row in result.all()]
+    count = len(contract_ids)
     
-    await session.execute(
-        delete(DailyContract)
-        .where(
-            DailyContract.target_date == target_date,
-            DailyContract.status == ContractStatus.draft,
+    if contract_ids:
+        # 2. DELETE child tasks first (avoids FK constraint / orphan rows)
+        await session.execute(
+            delete(Task).where(Task.contract_id.in_(contract_ids))
         )
-    )
+        # 3. DELETE parent contracts
+        await session.execute(
+            delete(DailyContract).where(DailyContract.id.in_(contract_ids))
+        )
+    
+    # 4. Commit is mandatory — ensures empty state before Gemini inserts
+    await session.commit()
     return count
 
 
@@ -263,7 +314,25 @@ async def add_task(
     contract_id: int,
     description: str,
     time_estimate: Optional[str] = None,
-) -> Task:
+) -> Optional[Task]:
+    import re
+
+    def _normalize(text: str) -> str:
+        """Strip all bracketed/parenthetical content, collapse whitespace, lowercase."""
+        stripped = re.sub(r'\[.*?\]|\(.*?\)', '', text)
+        return re.sub(r'\s+', ' ', stripped).strip().lower()
+
+    norm_desc = _normalize(description)
+
+    # Load existing tasks for this contract and fuzzy-compare
+    result = await session.execute(
+        select(Task).where(Task.contract_id == contract_id)
+    )
+    for t in result.scalars().all():
+        if _normalize(t.description) == norm_desc:
+            print(f"DEBUG: Dedup skip — '{description}' matches existing task.")
+            return None  # Skip fuzzy duplicate
+
     task = Task(
         contract_id=contract_id,
         description=description,
