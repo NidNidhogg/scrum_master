@@ -304,18 +304,24 @@ async def get_overdue_active_contracts(
     )
     all_active = result.scalars().all()
     
-    overdue = []
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=threshold_hours)
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(hours=threshold_hours)
     
     for c in all_active:
-        # Base activity is when the contract was approved (started_at)
+        # 2. Base activity – ensure UTC awareness (SQLite sometimes returns naive)
         last_activity = c.started_at
+        if last_activity and last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
         
-        # Check if any task was finished AFTER approval
+        # 3. Check if any task was finished AFTER approval
         for t in c.tasks:
             if t.status == TaskStatus.done and t.updated_at:
-                if last_activity is None or t.updated_at > last_activity:
-                    last_activity = t.updated_at
+                t_upd = t.updated_at
+                if t_upd.tzinfo is None:
+                    t_upd = t_upd.replace(tzinfo=timezone.utc)
+                    
+                if last_activity is None or t_upd > last_activity:
+                    last_activity = t_upd
         
         if last_activity and last_activity <= cutoff:
             overdue.append(c)
@@ -389,6 +395,18 @@ async def get_tasks_by_contract(
         select(Task).where(Task.contract_id == contract_id)
     )
     return result.scalars().all()
+
+
+async def get_task(session: AsyncSession, task_id: int) -> Optional[Task]:
+    result = await session.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .options(
+            selectinload(Task.contract).selectinload(DailyContract.user),
+            selectinload(Task.contract).selectinload(DailyContract.tasks)
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 # ──────────────────────────────────────────────

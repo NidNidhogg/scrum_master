@@ -17,6 +17,7 @@ from io import BytesIO
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -52,12 +53,17 @@ def _normalize(text: str) -> str:
 # Keyboards
 # ──────────────────────────────────────────────
 
-def _build_handshake_kb(contract_id: int) -> InlineKeyboardMarkup:
+def _build_handshake_kb(contract_id: int, task_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    """
+    Builds Approve/Edit buttons. 
+    Uses 't:ID' for specific tasks (manual) or 'c:ID' for full contracts (daily).
+    """
+    suffix = f"t:{task_id}" if task_id else f"c:{contract_id}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{contract_id}"),
-                InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit:{contract_id}"),
+                InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{suffix}"),
+                InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit:{suffix}"),
             ]
         ]
     )
@@ -403,7 +409,7 @@ async def cmd_todo(message: Message, session: AsyncSession) -> None:
                 target_user.notification_chat_id, 
                 text=msg, 
                 parse_mode="HTML", 
-                reply_markup=_build_handshake_kb(contract.id)
+                reply_markup=_build_handshake_kb(contract.id, task_id=task.id)
             )
             await message.reply(f"🚀 Task sent to {hbold(target_user.full_name or assignee_name)}.", parse_mode="HTML")
         except Exception:
@@ -447,23 +453,49 @@ async def handle_send_to_team(callback: CallbackQuery, session: AsyncSession) ->
     if not _is_lead(callback.from_user.id): return
     contracts = await repo.get_contracts_for_date(session)
     resolved = [c for c in contracts if c.status.value == "draft" and c.user_id is not None]
-    if not resolved: return await callback.answer("No resolved plans.", show_alert=True)
+    if not resolved: 
+        try:
+            return await callback.answer("No resolved plans.", show_alert=True)
+        except TelegramBadRequest:
+            return
     sent = 0
     for c in resolved:
         if c.user.notification_chat_id:
             msg = _format_draft_message(c.user.full_name or str(c.user.tg_id), c.tasks, c.meeting_context or "")
-            try: await callback.bot.send_message(c.user.notification_chat_id, text=msg, parse_mode="HTML", reply_markup=_build_handshake_kb(c.id)); sent += 1
-            except Exception: pass
-    await session.commit(); await callback.message.edit_text(f"🚀 Sent to {sent}.", parse_mode="HTML"); await callback.answer("Sent!")
+            try: 
+                await callback.bot.send_message(c.user.notification_chat_id, text=msg, parse_mode="HTML", reply_markup=_build_handshake_kb(c.id))
+                sent += 1
+            except Exception: 
+                pass
+    await session.commit()
+    
+    try:
+        await callback.message.edit_text(f"🚀 Sent to {sent}.", parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message:
+            raise
+            
+    try:
+        await callback.answer("Sent!")
+    except TelegramBadRequest:
+        pass
 
 @router.callback_query(F.data == "draft_edit")
 async def handle_draft_edit(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
     if not _is_lead(callback.from_user.id): return
     contracts = await repo.get_contracts_for_date(session)
     drafts = [c for c in contracts if c.status.value == "draft"]
-    if not drafts: return await callback.answer("Empty.")
+    if not drafts: 
+        try:
+            return await callback.answer("Empty.")
+        except TelegramBadRequest:
+            return
     await callback.message.answer(_format_drafts_for_editing(drafts), parse_mode="HTML")
-    await state.set_state(AdminStates.waiting_for_draft_edit); await callback.answer()
+    await state.set_state(AdminStates.waiting_for_draft_edit)
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
 
 @router.message(F.text, StateFilter(AdminStates.waiting_for_draft_edit))
 async def handle_draft_edit_sub(message: Message, session: AsyncSession, state: FSMContext) -> None:
@@ -475,4 +507,16 @@ async def handle_draft_edit_sub(message: Message, session: AsyncSession, state: 
 @router.callback_query(F.data == "draft_discard")
 async def handle_discard_drafts(callback: CallbackQuery, session: AsyncSession) -> None:
     if not _is_lead(callback.from_user.id): return
-    count = await repo.discard_daily_plans(session); await session.commit(); await callback.message.edit_text(f"🗑 Discarded {count}."); await callback.answer()
+    count = await repo.discard_daily_plans(session)
+    await session.commit()
+    
+    try:
+        await callback.message.edit_text(f"🗑 Discarded {count}.")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message:
+            raise
+            
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass

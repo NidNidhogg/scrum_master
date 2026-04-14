@@ -64,11 +64,27 @@ The bot ensures team momentum via an **APScheduler** background service.
 *   **Trigger:** Runs every hour at `:00` during working hours (10:00–19:00).
 *   **Last Update Tracking:** The monitor uses the `started_at` timestamp (from approval) as the base.
 *   **Reset Logic:** Any task marked as `done` updates the record's "last activity" timer, resetting the 4-hour countdown.
-*   **The Nudge:** If a developer goes 4+ working hours without an update, the bot sends a friendly automated DM to check if they are stuck.
+*   **Timezone Correction:** Fixed a legacy `TypeError` by ensuring all DB timestamps (SQLite naive) are force-converted to UTC before comparison with the current `now(tz=timezone.utc)`.
+*   **The Nudge:** If a developer goes 4+ working hours without an update, the bot sends a friendly automated DM.
 
 ---
 
-## 5. Database Schema (SQLAlchemy 2.0)
+## 5. Developer Interactions & Callbacks
+
+### Callback Data Strategy (The "Prefix" System)
+To prevent collisions between daily plans and individual ad-hoc tasks, the bot uses a typed prefix system in `callback_data`:
+*   `approve:c:ID`: Approves a whole **Contract** (all tasks in a daily stand-up).
+*   `approve:t:ID`: Approves a single **Task** (manual task assigned via `/todo`).
+This allows the bot to distinguish between a new manual assignment and an already-active daily plan, solving the "Already processed" collision bug.
+
+### Unified Notifications
+The `send_team_notification(bot, contract)` utility centralizes all team broadcasts. It automatically detects if a task is manual or transcript-based and formats accordingly:
+*   **Transcript:** `✅ [User] approved their daily plan`
+*   **Manual:** `🔥 [User] took a manual task: [Description]`
+
+---
+
+## 6. Database Schema (SQLAlchemy 2.0)
 
 ### Improved Tracking Fields
 - `DailyContract.started_at`: Time of developer approval (timer start).

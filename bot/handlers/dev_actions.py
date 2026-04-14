@@ -14,12 +14,14 @@ from aiogram import F, Router
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
+from aiogram.utils.markdown import hbold, hitalic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -68,6 +70,33 @@ def _build_dashboard_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+
+
+async def send_team_notification(bot, contract: DailyContract) -> None:
+    """
+    Consolidated group notification logic.
+    - Manual task: 🔥 [User] took a manual task: [Task description]
+    - Daily plan: ✅ [User] approved their daily plan
+    """
+    if not TEAM_CHAT_ID:
+        return
+
+    dev_name = contract.user.full_name or contract.user.username or str(contract.user.tg_id)
+    # Manual tasks are identified by meeting_context set in /todo
+    is_manual = (contract.meeting_context == "Manual task assignment")
+
+    if is_manual:
+        task_desc = contract.tasks[0].description if contract.tasks else "Unknown task"
+        team_text = f"🔥 {hbold(dev_name)} took a manual task: {task_desc}"
+    else:
+        team_text = f"✅ {hbold(dev_name)} approved their daily plan"
+
+    try:
+        await bot.send_message(TEAM_CHAT_ID, team_text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Failed to send team notification for contract %s", contract.id)
+
+
 # ──────────────────────────────────────────────
 # Flow 2a – Approve button
 # ──────────────────────────────────────────────
@@ -75,65 +104,105 @@ def _build_dashboard_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
 @router.callback_query(F.data.startswith("approve:"))
 async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None:
     bot = callback.bot
-    contract_id = int(callback.data.split(":")[1])
-
-    result = await session.execute(
-        select(DailyContract)
-        .where(DailyContract.id == contract_id)
-        .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
-    )
-    contract = result.scalar_one_or_none()
+    parts = callback.data.split(":")
+    # Format can be approve:c:ID (daily) or approve:t:ID (manual)
+    
+    task_id = None
+    contract = None
+    
+    if len(parts) == 3: # new format
+        type_prefix = parts[1]
+        id_val = int(parts[2])
+        if type_prefix == "t":
+            task_obj = await repo.get_task(session, id_val)
+            if task_obj:
+                contract = task_obj.contract
+                task_id = task_obj.id
+        else: # "c"
+            result = await session.execute(
+                select(DailyContract)
+                .where(DailyContract.id == id_val)
+                .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+            )
+            contract = result.scalar_one_or_none()
+    else: # legacy format approve:ID
+        contract_id = int(parts[1])
+        result = await session.execute(
+            select(DailyContract)
+            .where(DailyContract.id == contract_id)
+            .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+        )
+        contract = result.scalar_one_or_none()
 
     if contract is None:
-        await callback.answer("Contract not found.", show_alert=True)
+        try:
+            await callback.answer("Contract/Task not found.", show_alert=True)
+        except TelegramBadRequest:
+            pass
         return
 
     if contract.user.tg_id != callback.from_user.id:
-        await callback.answer("This is not your contract.", show_alert=True)
+        try:
+            await callback.answer("This is not your plan.", show_alert=True)
+        except TelegramBadRequest:
+            pass
         return
 
-    if contract.status != ContractStatus.draft:
-        await callback.answer("Already processed.", show_alert=True)
+    # ── Logic Change: Collisions ──────────────────────────────────────────
+    # If it's a manual task approval (task_id is set), we only care if THAT task is done.
+    # If it's a contract approval, we check the whole contract.
+    if task_id:
+        # Check specific task from the DB (refresh to be sure)
+        task_ref = await repo.get_task(session, task_id)
+        if task_ref.status != TaskStatus.todo:
+            try:
+                await callback.answer("Already processed! ✅", show_alert=True)
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+            return
+    elif contract.status != ContractStatus.draft:
+        try:
+            await callback.answer("Already processed.", show_alert=True)
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
         return
 
-    # ── 1. Activate contract → starts SLA timer ────────────────────────────
-    await repo.activate_contract(session, contract_id)
+    # ── 1. Activate ───────────────────────────────────────────────────────
+    await repo.activate_contract(session, contract.id)
 
-    # Mark all tasks as in_progress
-    for task in contract.tasks:
-        await repo.update_task_status(session, task.id, TaskStatus.in_progress)
+    # If task_id is set, only mark THAT task. Otherwise, all tasks.
+    if task_id:
+        await repo.update_task_status(session, task_id, TaskStatus.in_progress)
+    else:
+        for t in contract.tasks:
+            await repo.update_task_status(session, t.id, TaskStatus.in_progress)
 
-    # Commit so the flush is visible before we send messages
     await session.commit()
-
-    # Re-fetch tasks after flush (ids are stable, but be safe)
     await session.refresh(contract)
 
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
+    # ── 2. Immediate Broadcast to team chat (Refactored) ───────────────────
+    await send_team_notification(bot, contract)
 
-    dev_name = (
-        contract.user.full_name
-        or contract.user.username
-        or str(contract.user.tg_id)
-    )
-    tasks = contract.tasks
+    # ── 3. UI Update ───────────────────────────────────────────────────────
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message:
+            raise
 
-    # ── 2. Broadcast to team chat ──────────────────────────────────────────
-    if TEAM_CHAT_ID:
-        task_lines = "\n".join(f"- {t.description}" for t in tasks)
-        team_text = (
-            f"🚀 План утвержден: {dev_name} берет в работу:\n{task_lines}"
-        )
-        try:
-            await bot.send_message(TEAM_CHAT_ID, team_text)
-        except Exception:
-            logger.exception("Failed to broadcast approval to TEAM_CHAT_ID")
+    try:
+        await callback.answer()
+    except TelegramBadRequest:
+        pass
 
     # ── 3. Developer DM dashboard ──────────────────────────────────────────
     dev_tg_id = contract.user.tg_id
-    if tasks:
-        keyboard = _build_dashboard_keyboard(list(tasks))
+    dev_name = contract.user.full_name or contract.user.username or str(dev_tg_id)
+    
+    if contract.tasks:
+        keyboard = _build_dashboard_keyboard(list(contract.tasks))
         try:
             await bot.send_message(
                 dev_tg_id,
@@ -145,7 +214,7 @@ async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None
     else:
         await bot.send_message(dev_tg_id, "✅ Plan approved! Good luck today 🚀")
 
-    # Notify lead (legacy)
+    # Notify lead (legacy/info)
     if LEAD_TG_ID:
         try:
             await bot.send_message(
@@ -177,16 +246,25 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
     task = result.scalar_one_or_none()
 
     if task is None:
-        await callback.answer("Task not found.", show_alert=True)
+        try:
+            await callback.answer("Task not found.", show_alert=True)
+        except TelegramBadRequest:
+            pass
         return
 
     contract = task.contract
     if contract.user.tg_id != callback.from_user.id:
-        await callback.answer("This is not your task.", show_alert=True)
+        try:
+            await callback.answer("This is not your task.", show_alert=True)
+        except TelegramBadRequest:
+            pass
         return
 
     if task.status == TaskStatus.done:
-        await callback.answer("Already closed.", show_alert=True)
+        try:
+            await callback.answer("Already closed.", show_alert=True)
+        except TelegramBadRequest:
+            pass
         return
 
     # ── a) Mark task as done ───────────────────────────────────────────────
@@ -210,8 +288,9 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
         new_keyboard = _build_dashboard_keyboard(remaining_tasks)
         try:
             await callback.message.edit_reply_markup(reply_markup=new_keyboard)
-        except Exception:
-            logger.exception("Failed to edit dashboard keyboard")
+        except TelegramBadRequest as e:
+            if "message is not modified" not in e.message:
+                logger.exception("Failed to edit dashboard keyboard")
     else:
         # All tasks done – remove keyboard entirely
         try:
@@ -219,10 +298,14 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
                 "Твои задачи на сегодня:\n\n✅ Все задачи закрыты!",
                 reply_markup=None,
             )
-        except Exception:
-            logger.exception("Failed to clear dashboard keyboard")
+        except TelegramBadRequest as e:
+            if "message is not modified" not in e.message:
+                logger.exception("Failed to clear dashboard keyboard")
 
-    await callback.answer("Задача закрыта! ✅")
+    try:
+        await callback.answer("Задача закрыта! ✅")
+    except TelegramBadRequest:
+        pass
 
     # ── c) Notify team chat ────────────────────────────────────────────────
     if TEAM_CHAT_ID:
@@ -243,22 +326,36 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
 async def handle_edit_start(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    contract_id = int(callback.data.split(":")[1])
+    parts = callback.data.split(":")
+    contract = None
 
-    result = await session.execute(
-        select(DailyContract)
-        .where(DailyContract.id == contract_id)
-        .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
-    )
-    contract = result.scalar_one_or_none()
+    if len(parts) == 3:
+        type_prefix = parts[1]
+        id_val = int(parts[2])
+        if type_prefix == "t":
+            task_obj = await repo.get_task(session, id_val)
+            if task_obj: contract = task_obj.contract
+        else:
+            result = await session.execute(
+                select(DailyContract).where(DailyContract.id == id_val)
+                .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+            )
+            contract = result.scalar_one_or_none()
+    else: # legacy
+        contract_id = int(parts[1])
+        result = await session.execute(
+            select(DailyContract).where(DailyContract.id == contract_id)
+            .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+        )
+        contract = result.scalar_one_or_none()
 
     if contract is None or contract.user.tg_id != callback.from_user.id:
-        await callback.answer("Not your contract.", show_alert=True)
+        await callback.answer("Not your plan.", show_alert=True)
         return
 
     # Store context in FSM
     await state.set_state(AwaitingEdit.waiting_for_text)
-    await state.update_data(contract_id=contract_id)
+    await state.update_data(contract_id=contract.id)
 
     tasks_text = "\n".join(
         f"{i+1}. {t.description}" for i, t in enumerate(contract.tasks)
@@ -303,18 +400,69 @@ async def handle_edit_text(
 
     # Forward to Lead exactly as requested
     if LEAD_TG_ID:
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Approve Plan", callback_data=f"lead_approve_review:{contract_id}")
+        
         forward_msg = (
-            f"⚠️ {developer_name} proposes changes to their plan:\n\n"
+            f"⚠️ {hbold(developer_name)} proposes changes to their plan:\n\n"
             f"{proposed_text}\n\n"
-            f"(Please update the plan manually via the Edit Drafts menu if you approve)."
+            f"(You can approve the current state or edit it manually)."
         )
         try:
-            await bot.send_message(LEAD_TG_ID, forward_msg)
+            await bot.send_message(LEAD_TG_ID, forward_msg, parse_mode="HTML", reply_markup=kb.as_markup())
         except Exception:
             logger.exception("Failed to notify lead about proposed edit")
 
     await state.clear()
     await message.reply("✅ Your proposed changes have been sent to the Lead for review.")
+
+
+@router.callback_query(F.data.startswith("lead_approve_review:"))
+async def handle_lead_approve_edit(callback: CallbackQuery, session: AsyncSession) -> None:
+    """
+    Lead approves the developer's plan (often after manual edits or review).
+    """
+    if callback.from_user.id != LEAD_TG_ID:
+        return
+
+    contract_id = int(callback.data.split(":")[1])
+    
+    result = await session.execute(
+        select(DailyContract)
+        .where(DailyContract.id == contract_id)
+        .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+    )
+    contract = result.scalar_one_or_none()
+
+    if not contract or contract.status != ContractStatus.draft:
+        try:
+            await callback.answer("Plan already active or not found.")
+        except TelegramBadRequest:
+            pass
+        return
+
+    # 1. Activate contract
+    await repo.activate_contract(session, contract_id)
+    for task in contract.tasks:
+        await repo.update_task_status(session, task.id, TaskStatus.in_progress)
+
+    await session.commit()
+    await session.refresh(contract)
+
+    # 2. Notify team (DRY Refactored logic)
+    await send_team_notification(callback.bot, contract)
+
+    # 3. Update UI
+    try:
+        await callback.message.edit_text(f"✅ Plan for {contract.user.full_name} activated.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    
+    try:
+        await callback.answer("Plan activated! 🚀")
+    except TelegramBadRequest:
+        pass
 
 
 # ──────────────────────────────────────────────
