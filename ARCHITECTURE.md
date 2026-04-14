@@ -4,75 +4,80 @@ This document outlines the core architecture, data flows, and design decisions o
 
 ---
 
-## 1. Core Philosophy
-The bot acts as a specialized assistant that bridges the gap between raw meeting discussions and structured developer plans. It utilizes **Google Gemini** for high-reasoning parsing while maintaining a strict, Lead-controlled workflow.
+## 1. System Data Flow (The Handshake)
+
+The bot operates on a "Review & Approve" model to ensure 100% data accuracy before broadcasting to the team.
+
+```mermaid
+sequenceDiagram
+    participant L as Lead (Admin)
+    participant B as Scrum Bot
+    participant G as Gemini AI
+    participant D as Developer
+    participant T as Team Group
+
+    L->>B: Sends Transcript (Text/File)
+    B->>G: Parsing Request (REST)
+    G-->>B: Structured JSON (Tasks + Names)
+    B->>B: Resolve Identities (Smart Match)
+    B-->>L: Shows Final Review (Inline KB)
+    L->>B: [🚀 Send to Team]
+    B->>D: DM: Handshake Request (Inline KB)
+    D->>B: [✅ Approve]
+    B->>B: Activate Contract (DB)
+    B->>T: Broadcast: "Plan Approved"
+    B->>D: DM: Interactive Task Dashboard
+```
 
 ---
 
-## 2. System Flows
+## 2. AI Ingestion & Reasoning
 
-### Flow 1: Ingestion & Smart Parsing (The Clean Slate)
-- **Ruthless Cleanup**: Before re-parsing a date, the system performs an explicit two-step deletion: first deleting all child `Task` rows, then their parent `DailyContract` rows. This guarantees a clean slate and mitigates SQLite's default foreign key cascade limitations.
-- **Smart Identity Resolution**: Ingestion logic uses a hierarchy (Alias -> Full Name -> Username) across ALL users (not just developers) to link tasks.
-- **Dumb Extractor & Field Separation**:
-    - **Inclusive Extractor**: EVERY non-empty line under a developer's header is captured as a task, even without bullet points or dashes.
-    - **Field Separation**: The LLM strictly separates the `description` (action only, verbatim) from the `time_estimate` (designation for brackets like `[Сегодня]`, deadlines, or durations).
+### Contextual Disambiguation
+The bot handles complex team naming scenarios via the `INGESTION_SYSTEM` prompt. For example, in a team with two "Dmitrys":
+*   **Дмитрий Б. (Process Lead):** Assigned when context involves coordination, ceremonies, or process.
+*   **Дмитрий С. (Tech Director):** Assigned when context involves architecture, strategic logic, or deep technical implementation.
 
-### Flow 2: The Handshake (Developer Check-in)
-- **Activation Block**: Plans are sent to developers as `drafts`. A plan only becomes `active` once the developer approves it, starting the SLA monitor.
-- **Simple Forward (The Pivot)**: If a developer proposes changes via the `✏️ Edit` button, the bot captures their verbatim text and forwards it directly to the Lead's DM for manual review. 
-    - The database is **NOT** automatically updated by the AI.
-    - The contract remains as a `draft`.
-    - The Lead must manually apply the changes via the **Edit Drafts** menu if approved.
-
-### Flow 3: SLA & Active Monitoring
-- **Radar**: Every morning (11:00), the bot checks for developers who haven't approved their plans.
-- **Ping**: Every 30 minutes, it monitors active plans for un-updated tasks (no status changes for >4 hours).
+### The Delegation Rule
+The LLM distinguishes between the *speaker* and the *assignee*. If a Lead says "Alexey, please fix the bug," the task is assigned to Alexey, not the speaker.
 
 ---
 
-## 3. Database Schema Design (SQLAlchemy 2.0)
+## 3. The "Smart Match" Algorithm
 
-### `users`
-- `tg_id`: BigInteger (Unique Index)
-- `role`: Enum (Lead, Developer)
-- `notification_chat_id`: For asynchronous DMs.
+Identity resolution bridges the gap between spoken names in transcripts (unstructured) and Telegram IDs (structured). 
 
-### `user_aliases`
-- `user_id`: ForeignKey(users.id)
-- `alias`: Unique string (e.g., "Dmitriy", "Dimas").
-
-### `daily_contracts`
-- `user_id`: ForeignKey(users.id, nullable=True) — Resolved developer.
-- `lead_id`: ForeignKey(users.id) — **Sprint Ownership**. Identifies which Scrum Master initiated the contract, supporting shifts and multiple leads.
-- `developer_alias`: Original string used in parsing (fallback).
-- `status`: Enum (Draft, Active, Completed).
-- `target_date`: Date of the tasks.
-
-### `tasks`
-- `contract_id`: ForeignKey(daily_contracts.id)
-- `description`: Verbatim task action.
-- `time_estimate`: Metadata bucket (estimates, bracketed info).
-- `status`: Enum (Todo, In-progress, Done, Blocked).
+1.  **Normalization:** Both strings are stripped of whitespace and lowercased.
+2.  **Cleaning:** Trailing punctuation (dots, colons, commas) often added by LLMs are stripped using regex (`[\s:.,]+$`).
+3.  **Hierarchy:**
+    *   **Pass 1 (Alias):** Exact match in `user_aliases` table. Supports spaces and quotes.
+    *   **Pass 2 (Full Name):** Case-insensitive substring match on the user's Telegram profile name.
+    *   **Pass 3 (Username):** Case-insensitive substring match on the Telegram `@username`.
 
 ---
 
-## 4. Module Structure
+## 4. SLA & Performance Monitoring
 
-- **`bot/`**: Telegram interface (Aiogram 3).
-    - `handlers/admin.py`: Lead controls, atomic ingestion logic.
-    - `handlers/dev_actions.py`: Developer Handshake and SLA responses.
-- **`agent/`**: LLM bridge (Google Gemini API).
-    - `core.py`: Gemini API integration with tool calling.
-    - `prompts.py`: Strategic instructions for high-fidelity extraction.
-- **`db/`**: Persistence layer.
-    - `repository.py`: Atomic I/O and identity resolution.
-- **`.env`**:
-    - `GEMINI_API_KEY`: Required for parsing and synthesis.
-    - `LEAD_TG_ID`: Primary system administrator.
+The bot ensures team momentum via an **APScheduler** background service.
+
+### 4-Hour Idle Monitor
+*   **Trigger:** Runs every hour at `:00` during working hours (10:00–19:00).
+*   **Last Update Tracking:** The monitor uses the `started_at` timestamp (from approval) as the base.
+*   **Reset Logic:** Any task marked as `done` updates the record's "last activity" timer, resetting the 4-hour countdown.
+*   **The Nudge:** If a developer goes 4+ working hours without an update, the bot sends a friendly automated DM to check if they are stuck.
 
 ---
 
-## 5. Deployment Info
-- **Tech Stack**: Python 3.13, Aiogram 3.15, SQLAlchemy 2.0, APScheduler.
-- **Persistence**: SQLite (local) or PostgreSQL (production).
+## 5. Database Schema (SQLAlchemy 2.0)
+
+### Improved Tracking Fields
+- `DailyContract.started_at`: Time of developer approval (timer start).
+- `DailyContract.sla_ping_sent`: Boolean flag for the daily SLA nudge.
+- `Task.updated_at`: Automatically tracked on every status change (timer reset).
+
+---
+
+## 6. Deployment & Tech Stack
+- **Engine:** Python 3.13, Aiogram 3.15, SQLAlchemy 2.0, APScheduler.
+- **AI Integration:** Google Gemini REST transport (optimized with `asyncio.to_thread` for stability).
+- **Environment:** Containerized (Docker ready) with SQLite storage for simplicity.
