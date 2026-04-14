@@ -54,41 +54,39 @@ async def missing_persons_radar(bot) -> None:
 
 
 # ──────────────────────────────────────────────
-# Job 2 – SLA Monitor (every 30 min)
+# Job 2 – SLA Monitor (Every hour during working hours)
 # ──────────────────────────────────────────────
 
 async def sla_monitor(bot) -> None:
     logger.info("[SLA] Running SLA monitor…")
     async with AsyncSessionLocal() as session:
+        # threshold_hours=4 per requirements
         overdue = await repo.get_overdue_active_contracts(session, threshold_hours=4)
         if not overdue:
-            logger.info("[SLA] No overdue contracts.")
+            logger.info("[SLA] No idle users found.")
             return
 
         for contract in overdue:
             user = contract.user
-            if not user.notification_chat_id:
+            if not user or not user.notification_chat_id:
                 continue
 
-            tasks = [t for t in contract.tasks if t.status.value == "in_progress"]
-            if not tasks:
+            # Check if there are still unfinished tasks
+            has_pending = any(t.status.value != "done" for t in contract.tasks)
+            if not has_pending:
                 continue
 
-            try:
-                ping_text = await agent.generate_sla_ping(contract, tasks)
-            except Exception:
-                logger.exception("[SLA] Failed to generate ping for contract %s", contract.id)
-                continue
+            name = user.full_name or user.username or "dev"
+            ping_text = f"Hey {name}, it's been 4 hours since the last update. Any progress on your tasks? Let me know if you're stuck! 🤖"
 
             try:
                 await bot.send_message(user.notification_chat_id, ping_text)
+                await repo.mark_sla_ping_sent(session, contract.id)
+                await session.commit()
+                logger.info("[SLA] Pinged idle user %s (chat %s)", user.tg_id, user.notification_chat_id)
             except Exception:
                 logger.warning("[SLA] Failed to DM user %s", user.tg_id)
                 continue
-
-            await repo.mark_sla_ping_sent(session, contract.id)
-            await session.commit()
-            logger.info("[SLA] Pinged contract %s (user %s)", contract.id, user.tg_id)
 
 
 # ──────────────────────────────────────────────
@@ -106,7 +104,10 @@ async def evening_synthesis(bot) -> None:
         data_lines: list[str] = []
         for contract in contracts:
             user = contract.user
-            name = user.full_name or user.username or str(user.tg_id)
+            if user is None:
+                name = contract.developer_alias or f"Contract #{contract.id}"
+            else:
+                name = user.full_name or user.username or str(user.tg_id)
             data_lines.append(f"Developer: {name}")
             for task in contract.tasks:
                 data_lines.append(
@@ -156,7 +157,8 @@ def create_scheduler(bot) -> AsyncIOScheduler:
 
     scheduler.add_job(
         sla_monitor,
-        CronTrigger(minute="*/30", timezone=TZ),
+        # Every hour at :00 during working hours 10-19
+        CronTrigger(hour="10-19", minute=0, timezone=TZ),
         kwargs={"bot": bot},
         id="sla_monitor",
         replace_existing=True,

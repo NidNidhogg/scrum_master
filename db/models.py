@@ -67,7 +67,10 @@ class User(Base):
         "UserAlias", back_populates="user", cascade="all, delete-orphan"
     )
     contracts: Mapped[List["DailyContract"]] = relationship(
-        "DailyContract", back_populates="user"
+        "DailyContract", back_populates="lead", foreign_keys="[DailyContract.lead_id]"
+    )
+    assigned_contracts: Mapped[List["DailyContract"]] = relationship(
+        "DailyContract", back_populates="user", foreign_keys="[DailyContract.user_id]"
     )
     intraday_updates: Mapped[List["IntradayUpdate"]] = relationship(
         "IntradayUpdate", back_populates="user"
@@ -121,7 +124,12 @@ class DailyContract(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    user: Mapped["User"] = relationship("User", back_populates="contracts")
+    lead: Mapped[Optional["User"]] = relationship(
+        "User", back_populates="contracts", foreign_keys=[lead_id]
+    )
+    user: Mapped[Optional["User"]] = relationship(
+        "User", back_populates="assigned_contracts", foreign_keys=[user_id]
+    )
     tasks: Mapped[List["Task"]] = relationship(
         "Task", back_populates="contract", cascade="all, delete-orphan"
     )

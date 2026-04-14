@@ -97,19 +97,25 @@ async def resolve_alias(session: AsyncSession, alias: str) -> Optional[User]:
     return row.user if row else None
 
 
-async def add_alias(session: AsyncSession, user_id: int, alias: str) -> Optional[UserAlias]:
-    from sqlalchemy.exc import IntegrityError
-    try:
-        obj = UserAlias(user_id=user_id, alias=alias.strip().lower())
-        session.add(obj)
+async def upsert_alias(session: AsyncSession, user_id: int, alias: str) -> tuple[UserAlias, bool]:
+    """Returns (alias_obj, created). Updates user_id if alias exists."""
+    clean_alias = alias.strip().lower()
+    
+    # Check if exists
+    result = await session.execute(
+        select(UserAlias).where(UserAlias.alias == clean_alias)
+    )
+    obj = result.scalar_one_or_none()
+    
+    if obj:
+        obj.user_id = user_id
         await session.flush()
-        return obj
-    except IntegrityError:
-        # Alias already exists, potentially for another user or the same one.
-        # We rollback the specific savepoint (implicitly handled by session.rollback if needed,
-        # but here we just return None to let the handler know).
-        await session.rollback()
-        return None
+        return obj, False
+    
+    obj = UserAlias(user_id=user_id, alias=clean_alias)
+    session.add(obj)
+    await session.flush()
+    return obj, True
 
 
 async def get_all_aliases(session: AsyncSession) -> Sequence[UserAlias]:
@@ -283,18 +289,38 @@ async def get_contracts_for_date(
 async def get_overdue_active_contracts(
     session: AsyncSession, threshold_hours: int = 4
 ) -> Sequence[DailyContract]:
-    """Returns active contracts where elapsed time >= threshold and SLA ping not yet sent."""
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=threshold_hours)
+    """
+    Returns active contracts where user hasn't approved or finished a task for > thresh.
+    Priority: Max(started_at, Max(task.updated_at for done tasks))
+    """
+    # 1. Fetch all active contracts for today where ping hasn't been sent yet
     result = await session.execute(
         select(DailyContract)
         .where(
             DailyContract.status == ContractStatus.active,
             DailyContract.sla_ping_sent == False,
-            DailyContract.started_at <= cutoff,
         )
         .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
     )
-    return result.scalars().all()
+    all_active = result.scalars().all()
+    
+    overdue = []
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=threshold_hours)
+    
+    for c in all_active:
+        # Base activity is when the contract was approved (started_at)
+        last_activity = c.started_at
+        
+        # Check if any task was finished AFTER approval
+        for t in c.tasks:
+            if t.status == TaskStatus.done and t.updated_at:
+                if last_activity is None or t.updated_at > last_activity:
+                    last_activity = t.updated_at
+        
+        if last_activity and last_activity <= cutoff:
+            overdue.append(c)
+            
+    return overdue
 
 
 async def mark_sla_ping_sent(session: AsyncSession, contract_id: int) -> None:

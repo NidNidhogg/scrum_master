@@ -152,6 +152,44 @@ def _format_drafts_for_editing(contracts: list) -> str:
 # Ingestion Logic
 # ──────────────────────────────────────────────
 
+async def _resolve_user_by_name(
+    session: AsyncSession,
+    name_query: str,
+) -> Optional[repo.User]:
+    """
+    Smart Match helper: Aliases -> FullName -> Username.
+    """
+    import re as _re
+    # Clean query: strip whitespace and trailing punctuation (:, .)
+    clean_query = _re.sub(r'[\s:.,]+$', '', name_query.strip())
+    query_key = clean_query.lower()
+    
+    # Load all for matching
+    all_aliases = await repo.get_all_aliases(session)
+    all_users = await repo.get_all_users(session)
+    
+    # Pass 1: exact alias match
+    for alias_obj in all_aliases:
+        db_alias = alias_obj.alias.strip().lower()
+        if db_alias == query_key or db_alias in query_key or query_key in db_alias:
+            print(f"DEBUG: SmartMatch alias '{alias_obj.alias}' -> user {alias_obj.user.tg_id}")
+            return alias_obj.user
+
+    # Pass 2: full_name contains
+    for u in all_users:
+        if query_key in (u.full_name or "").strip().lower():
+            print(f"DEBUG: SmartMatch full_name '{u.full_name}' for '{clean_query}'")
+            return u
+
+    # Pass 3: username contains
+    for u in all_users:
+        if query_key in (u.username or "").strip().lower():
+            print(f"DEBUG: SmartMatch username '{u.username}' for '{clean_query}'")
+            return u
+            
+    return None
+
+
 async def _process_transcript(
     raw_text: str,
     session: AsyncSession,
@@ -169,41 +207,29 @@ async def _process_transcript(
         await status_message.edit_text(f"❌ Gemini parsing error: {escape(str(exc)[:200])}")
         return
 
-    # Load resolution data - fetch ALL USERS to include Lead
-    all_aliases = await repo.get_all_aliases(session)
-    all_users = await repo.get_all_users(session)
+    # FIX 3 - RE-LOAD SESSION: expire any cached objects so /alias updates
+    #          added AFTER the session was opened are visible here.
+    session.expire_all()
 
     seen_task_hashes: set[str] = set()
 
     for task_input in parsed.tasks:
-        assignee_raw = task_input.developer_alias
+        found_user = await _resolve_user_by_name(session, task_input.developer_alias)
         
-        # IDENTITY RESOLUTION: Aliases -> FullName -> Username (ALL roles)
-        found_user = None
-        for alias_obj in all_aliases:
-            if alias_obj.alias.lower() == assignee_raw.lower() or alias_obj.alias.lower() in assignee_raw.lower():
-                found_user = alias_obj.user
-                break
-        if not found_user:
-            for u in all_users:
-                if assignee_raw.lower() in (u.full_name or "").lower(): found_user = u; break
-        if not found_user:
-            for u in all_users:
-                if assignee_raw.lower() in (u.username or "").lower(): found_user = u; break
-
         user_id = found_user.id if found_user else None
+        assignee_key = (found_user.tg_id if found_user else task_input.developer_alias).lower() if not found_user else str(found_user.id)
 
         # BATCH DEDUP
-        dedup_key = f"{user_id or assignee_raw.lower()}_{_normalize(task_input.description)}"
+        dedup_key = f"{assignee_key}_{_normalize(task_input.description)}"
         if dedup_key in seen_task_hashes:
-            print(f"DEBUG: Batch dedup skip — '{task_input.description[:50]}'")
+            print(f"DEBUG: Batch dedup skip - '{task_input.description[:50]}'")
             continue
         seen_task_hashes.add(dedup_key)
 
         contract, _ = await repo.get_or_create_contract(
-            session, 
-            user_id=user_id, 
-            developer_alias=assignee_raw if not user_id else None,
+            session,
+            user_id=user_id,
+            developer_alias=task_input.developer_alias if not user_id else None,
             meeting_context=parsed.meeting_context,
             lead_tg_id=LEAD_TG_ID
         )
@@ -248,23 +274,143 @@ async def _register(message: Message, session: AsyncSession) -> None:
 @router.message(Command("alias"))
 async def cmd_alias(message: Message, session: AsyncSession, command: CommandObject) -> None:
     if not _is_lead(message.from_user.id): return
-    if not command.args or len(command.args.split()) < 2:
-        await message.reply(f"💡 Usage: {hcode('/alias &lt;name&gt; &lt;tg_id_or_@username&gt;')}", parse_mode="HTML")
-        return
-    parts = command.args.split()
-    alias_name, target_id = parts[0], parts[1]
-    target_user = None
-    if target_id.isdigit(): target_user = await repo.get_user_by_tg_id(session, int(target_id))
-    elif target_id.startswith("@"): target_user = await repo.get_user_by_username(session, target_id.lstrip("@"))
-    if not target_user: await message.reply("❌ User not found."); return
-    res = await repo.add_alias(session, user_id=target_user.id, alias=alias_name)
-    if not res: await message.reply("ℹ️ Alias already exists."); return
-    await session.commit(); await message.reply(f"✅ Linked {hcode(alias_name)}."); return
+    
+    try:
+        # Ensure session is present
+        if session is None:
+            await message.reply("❌ Error: Database session is missing.")
+            return
+
+        # 🔄 Refresh identity map (synchronous call, no await)
+        session.expire_all()
+        
+        import shlex
+        try:
+            # shlex.split properly handles quoted strings: /alias "Dmitry B." 123456
+            all_parts = shlex.split(message.text or "")
+            # all_parts[0] is typically '/alias', remaining are arguments
+            args = all_parts[1:]
+        except ValueError:
+            # Handle cases like unbalanced quotes
+            args = (command.args or "").split()
+
+        if len(args) < 2:
+            await message.reply(f"💡 Usage: {hcode('/alias \"Name With Spaces\" &lt;tg_id_or_@username&gt;')}", parse_mode="HTML")
+            return
+            
+        alias_name = args[0]
+        target_id = args[1].strip().strip("'\"")
+        
+        print(f"DEBUG: cmd_alias - Searching for user with ID/Username: '{target_id}'")
+        
+        target_user = None
+        if target_id.isdigit(): 
+            tg_id = int(target_id)
+            target_user = await repo.get_user_by_tg_id(session, tg_id)
+            if not target_user:
+                print(f"DEBUG: cmd_alias - User with tg_id {tg_id} NOT found in DB.")
+        elif target_id.startswith("@"):
+            username = target_id.lstrip("@")
+            target_user = await repo.get_user_by_username(session, username)
+            if not target_user:
+                print(f"DEBUG: cmd_alias - User with username '@{username}' NOT found in DB.")
+                
+        if not target_user: 
+            await message.reply(f"❌ User not found (searched: {hcode(target_id)}).") 
+            return
+            
+        res_obj, created = await repo.upsert_alias(session, user_id=target_user.id, alias=alias_name)
+        
+        target_name = target_user.full_name or target_user.username or str(target_user.tg_id)
+        
+        await session.commit()
+        
+        if created:
+            msg = f"✅ Linked {hcode(alias_name)} to {hbold(target_name)}."
+        else:
+            msg = f"🔄 Updated: alias {hcode(alias_name)} now points to {hbold(target_name)}."
+            
+        await message.reply(msg, parse_mode="HTML")
+    except Exception as e:
+        logger.exception("Error in cmd_alias")
+        await message.reply(f"❌ An error occurred: {escape(str(e))}")
+    return
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     if await state.get_state(): await state.clear(); await message.reply("✅ Cancelled.")
     else: await message.reply("ℹ️ Nothing to cancel.")
+
+@router.message(Command("chatid", "id"))
+async def cmd_chatid(message: Message) -> None:
+    """Utility: reply with the current chat's numeric ID. Works in DMs and groups."""
+    await message.reply(f"This chat's ID is: <code>{message.chat.id}</code>", parse_mode="HTML")
+
+
+@router.message(Command("todo"))
+async def cmd_todo(message: Message, session: AsyncSession) -> None:
+    """Manual task assignment: /todo \"Name\" Task description"""
+    if not _is_lead(message.from_user.id):
+        return
+
+    import shlex
+    try:
+        parts = shlex.split(message.text or "")
+        # parts[0] is '/todo', parts[1] is name, parts[2:] is task
+        if len(parts) < 3:
+            raise ValueError
+        assignee_name = parts[1]
+        task_desc = " ".join(parts[2:])
+    except (ValueError, IndexError):
+        await message.reply(f"💡 Usage: {hcode('/todo \"Name\" Task description')}", parse_mode="HTML")
+        return
+
+    session.expire_all()
+    target_user = await _resolve_user_by_name(session, assignee_name)
+
+    if not target_user:
+        await message.reply(f"❌ User not found: {hcode(assignee_name)}", parse_mode="HTML")
+        return
+
+    # Create / get contract for today
+    contract, _ = await repo.get_or_create_contract(
+        session,
+        user_id=target_user.id,
+        lead_tg_id=LEAD_TG_ID
+    )
+    
+    task = await repo.add_task(
+        session,
+        contract_id=contract.id,
+        description=task_desc
+    )
+    
+    if not task:
+        await message.reply("ℹ️ Task already exists for this user today.")
+        return
+
+    await session.commit()
+    
+    # ── Handshake Flow ─────────────────────────
+    if target_user.notification_chat_id:
+        msg = _format_draft_message(
+            target_user.full_name or str(target_user.tg_id), 
+            [task], 
+            "Manual task assignment"
+        )
+        try:
+            await message.bot.send_message(
+                target_user.notification_chat_id, 
+                text=msg, 
+                parse_mode="HTML", 
+                reply_markup=_build_handshake_kb(contract.id)
+            )
+            await message.reply(f"🚀 Task sent to {hbold(target_user.full_name or assignee_name)}.", parse_mode="HTML")
+        except Exception:
+            logger.exception("Failed to send manual task handshake")
+            await message.reply("❌ Task created but failed to send DM to developer.")
+    else:
+        await message.reply("✅ Task created in DB, but user has no notification chat ID.")
 
 @router.message(Command("daily"), StateFilter(None))
 @router.message(F.text, F.chat.type == "private", ~F.text.startswith("/"), StateFilter(None))
@@ -302,7 +448,6 @@ async def handle_send_to_team(callback: CallbackQuery, session: AsyncSession) ->
     contracts = await repo.get_contracts_for_date(session)
     resolved = [c for c in contracts if c.status.value == "draft" and c.user_id is not None]
     if not resolved: return await callback.answer("No resolved plans.", show_alert=True)
-    for c in resolved: await repo.activate_contract(session, c.id)
     sent = 0
     for c in resolved:
         if c.user.notification_chat_id:
