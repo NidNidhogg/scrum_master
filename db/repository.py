@@ -306,6 +306,7 @@ async def get_overdue_active_contracts(
     
     now = datetime.now(tz=timezone.utc)
     cutoff = now - timedelta(hours=threshold_hours)
+    overdue = []
     
     for c in all_active:
         # 2. Base activity – ensure UTC awareness (SQLite sometimes returns naive)
