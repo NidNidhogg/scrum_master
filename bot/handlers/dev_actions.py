@@ -75,8 +75,8 @@ def _build_dashboard_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
 async def send_team_notification(bot, contract: DailyContract) -> None:
     """
     Consolidated group notification logic.
-    - Manual task: 🔥 [User] took a manual task: [Task description]
-    - Daily plan: ✅ [User] approved their daily plan
+    - Manual task: ✅ [User] accepted a new task: [Task description]
+    - Daily plan:  ✅ [User] approved their daily plan:\n  • task 1\n  • task 2
     """
     if not TEAM_CHAT_ID:
         return
@@ -87,9 +87,16 @@ async def send_team_notification(bot, contract: DailyContract) -> None:
 
     if is_manual:
         task_desc = contract.tasks[0].description if contract.tasks else "Unknown task"
-        team_text = f"🔥 {hbold(dev_name)} took a manual task: {task_desc}"
+        team_text = (
+            f"✅ {hbold(dev_name)} accepted a new task:\n"
+            f"  • {hitalic(task_desc)}"
+        )
     else:
-        team_text = f"✅ {hbold(dev_name)} approved their daily plan"
+        task_lines = "\n".join(f"  • {hitalic(t.description)}" for t in contract.tasks)
+        team_text = (
+            f"✅ {hbold(dev_name)} approved their daily plan:\n"
+            f"{task_lines}"
+        )
 
     try:
         await bot.send_message(TEAM_CHAT_ID, team_text, parse_mode="HTML")
