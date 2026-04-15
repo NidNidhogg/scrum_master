@@ -33,6 +33,11 @@ from db.models import ContractStatus, DailyContract, Task, TaskStatus
 logger = logging.getLogger(__name__)
 router = Router()
 
+# Temporary store for proposed task text keyed by contract_id.
+# Keyed by contract_id -> raw proposed text string.
+# Lives in-process; sufficient for a single-instance bot.
+_pending_edits: dict[int, str] = {}
+
 def _parse_int_env(key: str, default: int = 0) -> int:
     val = os.getenv(key, "").strip()
     try:
@@ -405,6 +410,9 @@ async def handle_edit_text(
     )
     proposed_text = message.text or "[No text provided]"
 
+    # Stash proposed text so the Lead approval handler can apply it to the DB.
+    _pending_edits[contract_id] = proposed_text
+
     # Forward to Lead exactly as requested
     if LEAD_TG_ID:
         from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -449,15 +457,43 @@ async def handle_lead_approve_edit(callback: CallbackQuery, session: AsyncSessio
             pass
         return
 
-    # 1. Activate contract
+    # 1. Apply proposed task descriptions (if the developer submitted an edit).
+    proposed_text = _pending_edits.pop(contract_id, None)
+    if proposed_text:
+        # Parse the proposed text into individual task lines.
+        # Strips leading numbering ("1.", "-", "•") and blank lines.
+        import re
+        raw_lines = proposed_text.splitlines()
+        new_descriptions = [
+            re.sub(r'^[\s\d]+[.\-)•]\s*', '', line).strip()
+            for line in raw_lines
+            if line.strip()
+        ]
+        # Update DB task descriptions in order; skip extras if fewer tasks than lines.
+        for task, new_desc in zip(contract.tasks, new_descriptions):
+            if new_desc:
+                task.description = new_desc
+                session.add(task)
+        logger.info(
+            "Applied %d proposed description(s) to contract %s",
+            len(new_descriptions), contract_id,
+        )
+
+    # 2. Activate contract
     await repo.activate_contract(session, contract_id)
     for task in contract.tasks:
         await repo.update_task_status(session, task.id, TaskStatus.in_progress)
 
     await session.commit()
-    await session.refresh(contract)
+    # Refresh with relationships so send_team_notification sees updated descriptions.
+    result2 = await session.execute(
+        select(DailyContract)
+        .where(DailyContract.id == contract_id)
+        .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
+    )
+    contract = result2.scalar_one()
 
-    # 2. Notify team (DRY Refactored logic)
+    # 3. Notify team (DRY Refactored logic)
     await send_team_notification(callback.bot, contract)
 
     # 3. Update UI
