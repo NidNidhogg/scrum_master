@@ -68,25 +68,45 @@ async def sla_monitor(bot) -> None:
 
         for contract in overdue:
             user = contract.user
-            if not user or not user.notification_chat_id:
+            if not user:
+                logger.warning("[SLA] Contract %s has no linked user – skipping.", contract.id)
+                continue
+
+            # Resolve the chat to ping: prefer explicit notification_chat_id, fall back to tg_id.
+            chat_id = user.notification_chat_id or user.tg_id
+            if not chat_id:
+                logger.warning(
+                    "[SLA] User %s has neither notification_chat_id nor tg_id – skipping.",
+                    user.id,
+                )
                 continue
 
             # Check if there are still unfinished tasks
             has_pending = any(t.status.value != "done" for t in contract.tasks)
             if not has_pending:
+                logger.info("[SLA] Contract %s all tasks done – skipping ping.", contract.id)
                 continue
 
             name = user.full_name or user.username or "dev"
-            ping_text = f"Hey {name}, it's been 4 hours since the last update. Any progress on your tasks? Let me know if you're stuck! 🤖"
+            ping_text = (
+                f"Hey {name}, it's been 4 hours since the last update. "
+                f"Any progress on your tasks? Let me know if you're stuck! 🤖"
+            )
 
             try:
-                await bot.send_message(user.notification_chat_id, ping_text)
-                await repo.mark_sla_ping_sent(session, contract.id)
-                await session.commit()
-                logger.info("[SLA] Pinged idle user %s (chat %s)", user.tg_id, user.notification_chat_id)
+                await bot.send_message(chat_id, ping_text)
             except Exception:
-                logger.warning("[SLA] Failed to DM user %s", user.tg_id)
-                continue
+                logger.warning(
+                    "[SLA] Failed to DM user %s (chat %s) – will retry next cycle.",
+                    user.tg_id, chat_id,
+                    exc_info=True,  # captures the real TelegramNetworkError / etc.
+                )
+                continue  # do NOT mark as sent; let the next hourly run retry
+
+            # Only mark & commit after a confirmed successful send.
+            await repo.mark_sla_ping_sent(session, contract.id)
+            await session.commit()
+            logger.info("[SLA] Pinged user %s via chat %s", user.tg_id, chat_id)
 
 
 # ──────────────────────────────────────────────
