@@ -68,9 +68,12 @@ class AgentCore:
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type(GEMINI_RETRYABLE_EXCEPTIONS),
     )
-    async def parse_transcript(self, raw_transcript: str) -> BatchCreateContractsInput:
+    async def parse_transcript(
+        self, raw_transcript: str, existing_backlog: str = ""
+    ) -> BatchCreateContractsInput:
         """
         Call Gemini with tool use and extract BatchCreateContractsInput.
+        existing_backlog: a pre-formatted string of unfinished tasks from previous days.
         Uses asyncio.to_thread for REST transport stability.
         """
         print("DEBUG: [1] Preparing Gemini request for transcript parsing...")
@@ -79,14 +82,14 @@ class AgentCore:
                 system_instruction=prompts.INGESTION_SYSTEM,
                 tools=get_gemini_tools()
             )
-            
+
             print("DEBUG: [2] Request sent (via REST/thread), waiting...")
             # Using asyncio.to_thread because the REST transport in some SDK versions
             # does not reliably support generate_content_async without blocking.
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     model.generate_content,
-                    prompts.ingestion_user_prompt(raw_transcript),
+                    prompts.ingestion_user_prompt(raw_transcript, existing_backlog),
                     tool_config={"function_calling_config": {"mode": "ANY"}}
                 ),
                 timeout=45.0

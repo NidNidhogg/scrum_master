@@ -322,12 +322,23 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
     # ── c) Notify team chat ────────────────────────────────────────────────
     if TEAM_CHAT_ID:
         try:
-            await bot.send_message(
-                TEAM_CHAT_ID,
-                f"🔥 {dev_name} закрыл задачу: {task_description}",
-            )
+            if remaining_tasks:
+                remaining_lines = "\n".join(
+                    f"  • {hitalic(t.description)}" for t in remaining_tasks
+                )
+                team_msg = (
+                    f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
+                    f"Remaining tasks:\n{remaining_lines}"
+                )
+            else:
+                team_msg = (
+                    f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
+                    f"🎉 All tasks for today are completed!"
+                )
+            await bot.send_message(TEAM_CHAT_ID, team_msg, parse_mode="HTML")
         except Exception:
             logger.exception("Failed to send task-close notification to TEAM_CHAT_ID")
+
 
 
 # ──────────────────────────────────────────────

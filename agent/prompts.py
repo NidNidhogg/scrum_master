@@ -36,6 +36,14 @@ DUMB EXTRACTOR Mode: If the input appears to be a bulleted list (like an edited 
 STRICT NO-DUPLICATES: Do not repeat the same task multiple times for the same user in a single tool call. 
 Each item in the 'tasks' list must be unique and distinct.
 
+PERSISTENT BACKLOG MERGE (CRITICAL):
+- You will be provided with a list of "Existing Unfinished Tasks" for various developers.
+- Analyze the new transcript. 
+- If an existing task is mentioned in the transcript (e.g., developer says they are continuing it), you may update its details (like time estimate or description nuance) but do NOT create a new duplicate task.
+- If an existing task is NOT mentioned, keep it as it is in your proposed plan.
+- If new tasks are discussed, add them.
+- The final output should be a complete, merged set of tasks for each developer.
+
 Core Competency: Entity Resolution & Contextual Extraction
 - Extract precise Developer Names or Aliases.
 - Leverage context clues to distinguish between similar names.
@@ -72,9 +80,11 @@ Operational Rules:
 """
 
 
-def ingestion_user_prompt(raw_transcript: str) -> str:
+def ingestion_user_prompt(raw_transcript: str, existing_backlog: str = "") -> str:
+    backlog_section = f"\nEXISTING UNFINISHED TASKS:\n{existing_backlog}\n" if existing_backlog else ""
     return (
-        f"Parse the following meeting transcript and call BatchCreateContracts:\n\n"
+        f"Parse the following meeting transcript and call BatchCreateContracts.\n"
+        f"Integrate these with the existing backlog if provided.{backlog_section}\n\n"
         f"---\n{raw_transcript}\n---"
     )
 

@@ -202,12 +202,45 @@ async def _process_transcript(
     status_message: Message,
 ) -> None:
     today = date.today()
-    print(f"DEBUG: Triggering ruthlessly atomic cleanup for {today}...")
-    await repo.discard_daily_plans(session) # Already commits
-    print(f"DEBUG: Database wiped and committed for {today}.")
+    print(f"DEBUG: Starting persistent backlog cleanup for {today}...")
+    await repo.discard_daily_plans(session)  # carries over unfinished, deletes done, commits
+    print(f"DEBUG: Cleanup done for {today}.")
+
+    # ── Part 2: Build backlog context for Gemini ───────────────────────────
+    # fetch_unfinished tasks that were carried over to today's contracts.
+    from sqlalchemy import select as _select
+    from db.models import Task as _Task, DailyContract as _DC, TaskStatus as _TS
+    from sqlalchemy.orm import selectinload as _sil
+    carried_result = await session.execute(
+        _select(_Task)
+        .join(_DC)
+        .where(
+            _DC.target_date == today,
+            _Task.status != _TS.done,
+        )
+        .options(_sil(_Task.contract).selectinload(_DC.user))
+    )
+    carried_tasks = carried_result.scalars().all()
+
+    existing_backlog = ""
+    if carried_tasks:
+        lines = []
+        for t in carried_tasks:
+            user_label = "Unknown"
+            if t.contract and t.contract.user:
+                u = t.contract.user
+                user_label = u.full_name or u.username or str(u.tg_id)
+            elif t.contract and t.contract.developer_alias:
+                user_label = t.contract.developer_alias
+            lines.append(f"- {user_label}: {t.description}")
+        existing_backlog = "\n".join(lines)
+        print(f"DEBUG: Injecting {len(carried_tasks)} carried-over task(s) into Gemini context.")
+    else:
+        print("DEBUG: No carried-over tasks found. Fresh slate for Gemini.")
 
     try:
-        parsed = await agent.parse_transcript(raw_text)
+        # ── Part 3: Parse with backlog context ────────────────────────────
+        parsed = await agent.parse_transcript(raw_text, existing_backlog=existing_backlog)
     except Exception as exc:
         logger.exception("Transcript parsing failed: %s", exc)
         await status_message.edit_text(f"❌ Gemini parsing error: {escape(str(exc)[:200])}")
@@ -239,6 +272,9 @@ async def _process_transcript(
             meeting_context=parsed.meeting_context,
             lead_tg_id=LEAD_TG_ID
         )
+        # ── Part 4: DB integrity ──────────────────────────────────────────
+        # add_task uses fuzzy normalised dedup: if Gemini echoes back a carry-over
+        # task with the same description it will be skipped, not duplicated.
         await repo.add_task(
             session,
             contract_id=contract.id,
@@ -255,6 +291,7 @@ async def _process_transcript(
         return
 
     await status_message.edit_text(_format_final_review_message(drafts), parse_mode="HTML", reply_markup=_build_final_review_kb())
+
 
 
 # ──────────────────────────────────────────────

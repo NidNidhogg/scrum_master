@@ -237,37 +237,70 @@ async def activate_daily_plans(
     return contracts
 
 
+async def get_unfinished_tasks_before(
+    session: AsyncSession, target_date: date
+) -> Sequence[Task]:
+    """Finds all tasks from contracts before target_date that are NOT done/blocked."""
+    result = await session.execute(
+        select(Task)
+        .join(DailyContract)
+        .where(
+            DailyContract.target_date < target_date,
+            Task.status != TaskStatus.done,
+        )
+        .options(selectinload(Task.contract))
+    )
+    return result.scalars().all()
+
+
 async def discard_daily_plans(
     session: AsyncSession, target_date: Optional[date] = None
 ) -> int:
     """
-    RUTHLESS CLEANUP: Explicitly deletes child Tasks first, then Contracts for a date.
-    SQLite does not reliably cascade deletes unless PRAGMA foreign_keys=ON is set.
-    Returns count of deleted contracts.
+    PERSISTENT BACKLOG CLEANUP: 
+    1. Carries over unfinished tasks from previous days to target_date.
+    2. Deletes only 'done' tasks for the target_date (to allow re-runs).
+    3. Returns count of deleted tasks.
     """
     from sqlalchemy import delete
     target_date = target_date or date.today()
     
-    # 1. Get all contract IDs for this date
+    # 1. Carry over unfinished tasks from the past
+    unfinished_past = await get_unfinished_tasks_before(session, target_date)
+    for task in unfinished_past:
+        # Move to a contract on target_date
+        new_contract, _ = await get_or_create_contract(
+            session, 
+            user_id=task.contract.user_id,
+            developer_alias=task.contract.developer_alias,
+            target_date=target_date
+        )
+        task.contract_id = new_contract.id
+        session.add(task)
+
+    # 2. DELETE 'done' tasks for this date (allows lead to re-run transcript without losing carry-overs)
     result = await session.execute(
         select(DailyContract.id).where(DailyContract.target_date == target_date)
     )
     contract_ids = [row[0] for row in result.all()]
-    count = len(contract_ids)
     
+    deleted_count = 0
     if contract_ids:
-        # 2. DELETE child tasks first (avoids FK constraint / orphan rows)
-        await session.execute(
-            delete(Task).where(Task.contract_id.in_(contract_ids))
+        # Delete only DONE tasks
+        res = await session.execute(
+            delete(Task).where(
+                Task.contract_id.in_(contract_ids),
+                Task.status == TaskStatus.done
+            )
         )
-        # 3. DELETE parent contracts
-        await session.execute(
-            delete(DailyContract).where(DailyContract.id.in_(contract_ids))
-        )
+        deleted_count = res.rowcount
+        
+        # We DON'T delete the contracts themselves here because they might hold carry-over tasks
+        # the lead wants to keep. Empty contracts will be cleaned up by get_contracts_for_date filters if needed,
+        # or we just keep them.
     
-    # 4. Commit is mandatory — ensures empty state before Gemini inserts
     await session.commit()
-    return count
+    return deleted_count
 
 
 async def get_contracts_for_date(
