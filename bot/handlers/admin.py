@@ -83,9 +83,14 @@ def _build_final_review_kb() -> InlineKeyboardMarkup:
     )
 
 
+
 # ──────────────────────────────────────────────
 # Message Formatters
 # ──────────────────────────────────────────────
+
+_TG_MAX_LEN = 4000  # Leave 96 chars below Telegram's hard 4096 limit as safety margin
+_TRUNCATION_NOTICE = "\n\n⚠️ <i>[Truncated – list too long. Use /drafts or check the DB for the full plan.]</i>"
+
 
 def _format_draft_message(developer_name: str, tasks: list, meeting_context: str) -> str:
     task_lines = []
@@ -104,10 +109,10 @@ def _format_draft_message(developer_name: str, tasks: list, meeting_context: str
 
 
 def _format_final_review_message(contracts: list) -> str:
-    parts = [f"🧐 {hbold(f'Final Review – Today’s Drafts')} ({date.today()})\n"]
-    
+    parts = [f"🧐 {hbold(f'Final Review – Today\u2019s Drafts')} ({date.today()})\n"]
+
     sorted_contracts = sorted(
-        contracts, 
+        contracts,
         key=lambda c: (0 if c.user_id else 1, (c.user.full_name or "") if c.user else (c.developer_alias or ""))
     )
 
@@ -118,7 +123,7 @@ def _format_final_review_message(contracts: list) -> str:
         else:
             name_raw = escape(c.developer_alias or 'Unknown')
             header = f"👤 {hbold(f'{name_raw} (Unresolved)')}"
-            
+
         parts.append(header)
         for i, t in enumerate(c.tasks):
             desc = escape(t.description)
@@ -128,9 +133,20 @@ def _format_final_review_message(contracts: list) -> str:
 
     if any(not c.user_id for c in contracts):
         parts.append(f"⚠️ {hitalic('Some users are unresolved. Link them with /alias to send their plans.')}")
-    
+
     parts.append(f"\n{hitalic('Ready to launch the Handshake flow?')}")
-    return "\n".join(parts)
+
+    # ── Safe length cap: truncate whole lines, never mid-tag ──────────────
+    full_text = "\n".join(parts)
+    if len(full_text) <= _TG_MAX_LEN:
+        return full_text
+
+    # Drop lines from the end until the text + notice fits.
+    notice_len = len(_TRUNCATION_NOTICE)
+    while parts and len("\n".join(parts)) + notice_len > _TG_MAX_LEN:
+        parts.pop()
+
+    return "\n".join(parts) + _TRUNCATION_NOTICE
 
 
 def _format_drafts_for_editing(contracts: list) -> str:
