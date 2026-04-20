@@ -109,6 +109,21 @@ async def send_team_notification(bot, contract: DailyContract) -> None:
         logger.exception("Failed to send team notification for contract %s", contract.id)
 
 
+_TG_MAX_LEN = 4000
+_TRUNCATION_NOTICE = "\n\n⚠️ <i>[Truncated – message too long.]</i>"
+
+
+def _safe_truncate(text: str) -> str:
+    """Truncate an HTML message to _TG_MAX_LEN chars by popping whole lines."""
+    if len(text) <= _TG_MAX_LEN:
+        return text
+    lines = text.split("\n")
+    notice_len = len(_TRUNCATION_NOTICE)
+    while lines and len("\n".join(lines)) + notice_len > _TG_MAX_LEN:
+        lines.pop()
+    return "\n".join(lines) + _TRUNCATION_NOTICE
+
+
 # ──────────────────────────────────────────────
 # Flow 2a – Approve button
 # ──────────────────────────────────────────────
@@ -203,16 +218,17 @@ async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None
     except TelegramBadRequest as e:
         if "message is not modified" not in e.message:
             raise
+    finally:
+        # Always dismiss the spinner, even if an error occurred above.
+        try:
+            await callback.answer()
+        except TelegramBadRequest:
+            pass
 
-    try:
-        await callback.answer()
-    except TelegramBadRequest:
-        pass
-
-    # ── 3. Developer DM dashboard ──────────────────────────────────────────
+    # ── 4. Developer DM dashboard ──────────────────────────────────────────
     dev_tg_id = contract.user.tg_id
     dev_name = contract.user.full_name or contract.user.username or str(dev_tg_id)
-    
+
     if contract.tasks:
         keyboard = _build_dashboard_keyboard(list(contract.tasks))
         try:
@@ -235,6 +251,7 @@ async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None
             )
         except Exception:
             logger.exception("Failed to notify lead")
+
 
 
 # ──────────────────────────────────────────────
@@ -335,9 +352,10 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
                     f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
                     f"🎉 All tasks for today are completed!"
                 )
-            await bot.send_message(TEAM_CHAT_ID, team_msg, parse_mode="HTML")
+            await bot.send_message(TEAM_CHAT_ID, _safe_truncate(team_msg), parse_mode="HTML")
         except Exception:
             logger.exception("Failed to send task-close notification to TEAM_CHAT_ID")
+
 
 
 

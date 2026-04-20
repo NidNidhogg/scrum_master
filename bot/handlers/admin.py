@@ -240,19 +240,29 @@ async def _process_transcript(
 
     existing_backlog = ""
     if carried_tasks:
-        lines = []
+        # Group strictly by user to prevent Gemini from misassigning tasks.
+        from collections import defaultdict
+        user_task_map: dict[str, list[str]] = defaultdict(list)
         for t in carried_tasks:
-            user_label = "Unknown"
             if t.contract and t.contract.user:
                 u = t.contract.user
                 user_label = u.full_name or u.username or str(u.tg_id)
             elif t.contract and t.contract.developer_alias:
                 user_label = t.contract.developer_alias
-            lines.append(f"- {user_label}: {t.description}")
-        existing_backlog = "\n".join(lines)
-        print(f"DEBUG: Injecting {len(carried_tasks)} carried-over task(s) into Gemini context.")
+            else:
+                user_label = "Unknown"
+            user_task_map[user_label].append(t.description)
+
+        backlog_lines = []
+        for user_label, descs in user_task_map.items():
+            backlog_lines.append(f"User: {user_label}")
+            for d in descs:
+                backlog_lines.append(f"- {d}")
+        existing_backlog = "\n".join(backlog_lines)
+        print(f"DEBUG: Injecting {len(carried_tasks)} carried-over task(s) for {len(user_task_map)} user(s) into Gemini context.")
     else:
         print("DEBUG: No carried-over tasks found. Fresh slate for Gemini.")
+
 
     try:
         # ── Part 3: Parse with backlog context ────────────────────────────

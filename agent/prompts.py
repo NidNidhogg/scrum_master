@@ -37,11 +37,13 @@ STRICT NO-DUPLICATES: Do not repeat the same task multiple times for the same us
 Each item in the 'tasks' list must be unique and distinct.
 
 PERSISTENT BACKLOG MERGE (CRITICAL):
-- You will be provided with a list of "Existing Unfinished Tasks" for various developers.
-- Analyze the new transcript. 
-- If an existing task is mentioned in the transcript (e.g., developer says they are continuing it), you may update its details (like time estimate or description nuance) but do NOT create a new duplicate task.
-- If an existing task is NOT mentioned, keep it as it is in your proposed plan.
+- You will be provided with a list of "Existing Unfinished Tasks" grouped by user.
+- Each group starts with "User: [Name]" followed by "- [task]" lines.
+- ONLY assign backlog tasks back to the EXACT user listed under their "User:" header. NEVER reassign them to a different developer.
+- If an existing task is mentioned in the transcript (e.g., developer says they are continuing it), include it once — do NOT create a new duplicate task.
+- If an existing task is NOT mentioned, keep it in the plan unchanged.
 - If new tasks are discussed, add them.
+- EXACT WORDING PRESERVATION (CRITICAL FOR DATABASE INTEGRITY): When carrying over existing backlog tasks, you MUST copy their description EXACTLY as written. DO NOT append time tags, brackets, or comments like "(Сегодня)", "(Today)", "(После инстр.)", or any other annotation. Even minor wording changes will cause duplicate rows in the database. Copy the text character-for-character.
 - The final output should be a complete, merged set of tasks for each developer.
 
 Core Competency: Entity Resolution & Contextual Extraction
