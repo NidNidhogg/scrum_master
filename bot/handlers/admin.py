@@ -276,37 +276,51 @@ async def _process_transcript(
     #          added AFTER the session was opened are visible here.
     session.expire_all()
 
+    # ── Part 3: Merge LLM output into a single dictionary by user ──────────
+    from collections import defaultdict
+    # Key = normalized developer name or user_id string
+    # Value = list of TaskInput objects
+    merged_tasks = defaultdict(list)
+    
+    for task_input in parsed.tasks:
+        # We normalize the alias to handle case/spacing variants from Gemini
+        alias = task_input.developer_alias.strip()
+        merged_tasks[alias].append(task_input)
+
+    print(f"DEBUG: Merging complete. Found {len(merged_tasks)} developers.")
+
     seen_task_hashes: set[str] = set()
 
-    for task_input in parsed.tasks:
-        found_user = await _resolve_user_by_name(session, task_input.developer_alias)
-        
+    # ── Part 4: Process pooled tasks per developer ─────────────────────────
+    for alias, tasks in merged_tasks.items():
+        found_user = await _resolve_user_by_name(session, alias)
         user_id = found_user.id if found_user else None
-        assignee_key = (found_user.tg_id if found_user else task_input.developer_alias).lower() if not found_user else str(found_user.id)
-
-        # BATCH DEDUP
-        dedup_key = f"{assignee_key}_{_normalize(task_input.description)}"
-        if dedup_key in seen_task_hashes:
-            print(f"DEBUG: Batch dedup skip - '{task_input.description[:50]}'")
-            continue
-        seen_task_hashes.add(dedup_key)
-
+        
+        # Get/Create ONE contract for this developer
         contract, _ = await repo.get_or_create_contract(
             session,
             user_id=user_id,
-            developer_alias=task_input.developer_alias if not user_id else None,
+            developer_alias=alias if not user_id else None,
             meeting_context=parsed.meeting_context,
             lead_tg_id=LEAD_TG_ID
         )
-        # ── Part 4: DB integrity ──────────────────────────────────────────
-        # add_task uses fuzzy normalised dedup: if Gemini echoes back a carry-over
-        # task with the same description it will be skipped, not duplicated.
-        await repo.add_task(
-            session,
-            contract_id=contract.id,
-            description=task_input.description,
-            time_estimate=task_input.time_estimate,
-        )
+
+        for task_input in tasks:
+            # BATCH DEDUP (per user)
+            assignee_key = str(user_id) if user_id else alias.lower()
+            dedup_key = f"{assignee_key}_{_normalize(task_input.description)}"
+            
+            if dedup_key in seen_task_hashes:
+                print(f"DEBUG: Batch dedup skip - '{task_input.description[:50]}'")
+                continue
+            seen_task_hashes.add(dedup_key)
+
+            await repo.add_task(
+                session,
+                contract_id=contract.id,
+                description=task_input.description,
+                time_estimate=task_input.time_estimate,
+            )
 
     await session.commit()
     contracts = await repo.get_contracts_for_date(session)
@@ -480,6 +494,41 @@ async def cmd_todo(message: Message, session: AsyncSession) -> None:
             await message.reply("❌ Task created but failed to send DM to developer.")
     else:
         await message.reply("✅ Task created in DB, but user has no notification chat ID.")
+
+@router.message(Command("check"))
+async def cmd_check(message: Message, session: AsyncSession) -> None:
+    """Dynamic team status check: list all open tasks grouped by whatever users are in DB."""
+    if not _is_lead(message.from_user.id):
+        return
+
+    open_tasks = await repo.get_all_open_tasks(session)
+    
+    if not open_tasks:
+        await message.reply("✅ All clear! No open tasks for today.")
+        return
+
+    # Dynamic grouping by User
+    from collections import defaultdict
+    user_groups = defaultdict(list)
+    
+    for t in open_tasks:
+        if t.contract and t.contract.user:
+            u = t.contract.user
+            name = u.full_name or u.username or f"User {u.tg_id}"
+        else:
+            name = t.contract.developer_alias or "Unknown"
+        user_groups[name].append(t.description)
+
+    parts = ["📋 " + hbold("Current Team Status (Open Tasks):") + "\n"]
+    
+    # Sort groups by name for consistent output
+    for name in sorted(user_groups.keys()):
+        parts.append(f"👤 {hbold(name)}:")
+        for desc in user_groups[name]:
+            parts.append(f"• {escape(desc)}")
+        parts.append("") # Spacer between users
+
+    await message.reply("\n".join(parts), parse_mode="HTML")
 
 @router.message(Command("daily"), StateFilter(None))
 @router.message(F.text, F.chat.type == "private", ~F.text.startswith("/"), StateFilter(None))

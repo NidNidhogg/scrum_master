@@ -431,6 +431,22 @@ async def get_tasks_by_contract(
     return result.scalars().all()
 
 
+async def get_all_open_tasks(session: AsyncSession, target_date: Optional[date] = None) -> Sequence[Task]:
+    """Fetches all open tasks (todo/in_progress) across the whole team for a specific date (default today)."""
+    target_date = target_date or date.today()
+    result = await session.execute(
+        select(Task)
+        .join(DailyContract)
+        .where(
+            DailyContract.target_date == target_date,
+            Task.status.in_([TaskStatus.todo, TaskStatus.in_progress])
+        )
+        .options(selectinload(Task.contract).selectinload(DailyContract.user))
+        .order_by(DailyContract.user_id)
+    )
+    return result.scalars().all()
+
+
 async def get_task(session: AsyncSession, task_id: int) -> Optional[Task]:
     result = await session.execute(
         select(Task)

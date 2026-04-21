@@ -74,6 +74,8 @@ NEVER output just "Дмитрий" or "Dmitry" — always use the full disambigu
     → Is the context about technical implementation / business decisions? → "Дмитрий С."
     → Still ambiguous? Default to "Дмитрий С." (tech dir is more likely to have tasks).
 
+COMPREHENSIVE EXTRACTION & AGGREGATION RULE: You MUST extract EVERY SINGLE task mentioned in the transcript. Scan the text line-by-line. If a user is mentioned on multiple different lines (e.g., first in a joint task, and later in individual tasks), you MUST APPEND every new task to their consolidated list. DO NOT overwrite or drop tasks. You must act as an exhaustive parser.
+
 Operational Rules:
 1. Call the BatchCreateContracts tool with your findings.
 2. Ensure descriptions are actionable and technically accurate.

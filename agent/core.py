@@ -76,20 +76,22 @@ class AgentCore:
         existing_backlog: a pre-formatted string of unfinished tasks from previous days.
         Uses asyncio.to_thread for REST transport stability.
         """
-        print("DEBUG: [1] Preparing Gemini request for transcript parsing...")
+        print("DEBUG: [1] Preparing stateless Gemini request for transcript parsing...")
         try:
+            # Re-initialize the model to ensure NO state/history carryover from previous calls.
+            # We explicitly do NOT use model.start_chat() to maintain statelessness.
             model = self._get_model(
                 system_instruction=prompts.INGESTION_SYSTEM,
                 tools=get_gemini_tools()
             )
 
-            print("DEBUG: [2] Request sent (via REST/thread), waiting...")
-            # Using asyncio.to_thread because the REST transport in some SDK versions
-            # does not reliably support generate_content_async without blocking.
+            print("DEBUG: [2] Request sent (stateless / fresh instance), waiting...")
+            # generate_content is a stateless call. By providing no history 
+            # and using a fresh model instance, we satisfy the stateless constraint.
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     model.generate_content,
-                    prompts.ingestion_user_prompt(raw_transcript, existing_backlog),
+                    contents=prompts.ingestion_user_prompt(raw_transcript, existing_backlog),
                     tool_config={"function_calling_config": {"mode": "ANY"}}
                 ),
                 timeout=45.0
