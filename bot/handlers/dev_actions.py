@@ -125,6 +125,66 @@ def _safe_truncate(text: str) -> str:
 
 
 # ──────────────────────────────────────────────
+# Accordion helpers (team-chat remaining-tasks UI)
+# ──────────────────────────────────────────────
+
+_ACCORDION_THRESHOLD = 3  # show all tasks inline if count ≤ this
+
+
+def _build_remaining_text(
+    dev_name: str,
+    task_description: str,
+    remaining_tasks: list[Task],
+    *,
+    limit: int | None = None,
+) -> str:
+    """Build the team-notification HTML for a task-close event.
+
+    Args:
+        limit: if set, render only the first *limit* tasks (accordion collapsed view).
+    """
+    tasks_to_show = remaining_tasks[:limit] if limit is not None else remaining_tasks
+    remaining_lines = "\n".join(
+        f"  • {hitalic(t.description)}" for t in tasks_to_show
+    )
+    return (
+        f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
+        f"Remaining tasks:\n{remaining_lines}"
+    )
+
+
+def _build_toggle_keyboard(
+    contract_id: int,
+    *,
+    action: str,
+    hidden_count: int = 0,
+) -> InlineKeyboardMarkup:
+    """Return a one-button inline keyboard for expanding or collapsing the task list.
+
+    Args:
+        action:       "expand" → show expand button; "collapse" → show collapse button.
+        hidden_count: number of tasks hidden (used only for the expand label).
+    """
+    if action == "expand":
+        label = f"🔽 Развернуть (ещё {hidden_count})"
+        next_action = "expand"
+    else:
+        label = "🔼 Свернуть"
+        next_action = "collapse"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"toggle_rem:{contract_id}:{next_action}",
+                )
+            ]
+        ]
+    )
+
+
+# ──────────────────────────────────────────────
 # Flow 2a – Approve button
 # ──────────────────────────────────────────────
 
@@ -339,22 +399,134 @@ async def handle_close_task(callback: CallbackQuery, session: AsyncSession) -> N
     # ── c) Notify team chat ────────────────────────────────────────────────
     if TEAM_CHAT_ID:
         try:
-            if remaining_tasks:
-                remaining_lines = "\n".join(
-                    f"  • {hitalic(t.description)}" for t in remaining_tasks
-                )
-                team_msg = (
-                    f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
-                    f"Remaining tasks:\n{remaining_lines}"
-                )
-            else:
+            if not remaining_tasks:
                 team_msg = (
                     f"🔥 {hbold(dev_name)} закрыл задачу: {hitalic(task_description)}\n\n"
                     f"🎉 All tasks for today are completed!"
                 )
-            await bot.send_message(TEAM_CHAT_ID, _safe_truncate(team_msg), parse_mode="HTML")
+                await bot.send_message(
+                    TEAM_CHAT_ID,
+                    _safe_truncate(team_msg),
+                    parse_mode="HTML",
+                )
+            elif len(remaining_tasks) <= _ACCORDION_THRESHOLD:
+                # Short list – show everything inline, no toggle button needed.
+                team_msg = _build_remaining_text(
+                    dev_name, task_description, remaining_tasks
+                )
+                await bot.send_message(
+                    TEAM_CHAT_ID,
+                    _safe_truncate(team_msg),
+                    parse_mode="HTML",
+                )
+            else:
+                # Long list – show first N tasks + expand button.
+                hidden_count = len(remaining_tasks) - _ACCORDION_THRESHOLD
+                team_msg = _build_remaining_text(
+                    dev_name,
+                    task_description,
+                    remaining_tasks,
+                    limit=_ACCORDION_THRESHOLD,
+                )
+                toggle_kb = _build_toggle_keyboard(
+                    contract.id,
+                    action="expand",
+                    hidden_count=hidden_count,
+                )
+                await bot.send_message(
+                    TEAM_CHAT_ID,
+                    _safe_truncate(team_msg),
+                    parse_mode="HTML",
+                    reply_markup=toggle_kb,
+                )
         except Exception:
             logger.exception("Failed to send task-close notification to TEAM_CHAT_ID")
+
+
+# ──────────────────────────────────────────────
+# Flow 4b – Accordion toggle (expand / collapse remaining tasks)
+# ──────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("toggle_rem:"))
+async def handle_toggle_remaining(
+    callback: CallbackQuery, session: AsyncSession
+) -> None:
+    """Expand or collapse the 'remaining tasks' list in a team-chat notification."""
+    try:
+        _, contract_id_str, action = callback.data.split(":")
+        contract_id = int(contract_id_str)
+    except ValueError:
+        await callback.answer("Invalid toggle data.", show_alert=True)
+        return
+
+    # Load contract + tasks + developer name.
+    result = await session.execute(
+        select(DailyContract)
+        .where(DailyContract.id == contract_id)
+        .options(
+            selectinload(DailyContract.tasks),
+            selectinload(DailyContract.user),
+        )
+    )
+    contract = result.scalar_one_or_none()
+
+    if contract is None:
+        await callback.answer("Contract not found.", show_alert=True)
+        return
+
+    dev_name = (
+        contract.user.full_name
+        or contract.user.username
+        or str(contract.user.tg_id)
+    )
+    remaining_tasks = [
+        t for t in contract.tasks if t.status != TaskStatus.done
+    ]
+
+    # Re-derive the closed task description from the existing message text
+    # (we don't have it here, so we reconstruct the header from message text).
+    # Strategy: preserve everything up to the first "\n\nRemaining tasks:" block.
+    original_text: str = callback.message.text or callback.message.caption or ""
+    header_end = original_text.find("\n\nRemaining tasks:")
+    if header_end != -1:
+        header = original_text[:header_end]
+    else:
+        # Fallback: use the first line
+        header = original_text.split("\n")[0]
+
+    try:
+        if action == "expand":
+            # Show ALL remaining tasks.
+            remaining_lines = "\n".join(
+                f"  • {hitalic(t.description)}" for t in remaining_tasks
+            )
+            new_text = f"{header}\n\nRemaining tasks:\n{remaining_lines}"
+            new_kb = _build_toggle_keyboard(contract_id, action="collapse")
+        else:  # "collapse"
+            # Show first _ACCORDION_THRESHOLD tasks + expand button.
+            hidden_count = max(0, len(remaining_tasks) - _ACCORDION_THRESHOLD)
+            tasks_to_show = remaining_tasks[:_ACCORDION_THRESHOLD]
+            remaining_lines = "\n".join(
+                f"  • {hitalic(t.description)}" for t in tasks_to_show
+            )
+            new_text = f"{header}\n\nRemaining tasks:\n{remaining_lines}"
+            new_kb = _build_toggle_keyboard(
+                contract_id, action="expand", hidden_count=hidden_count
+            )
+
+        await callback.message.edit_text(
+            _safe_truncate(new_text),
+            parse_mode="HTML",
+            reply_markup=new_kb,
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message:
+            logger.exception("Failed to toggle remaining tasks view")
+    finally:
+        try:
+            await callback.answer()
+        except TelegramBadRequest:
+            pass
 
 
 
