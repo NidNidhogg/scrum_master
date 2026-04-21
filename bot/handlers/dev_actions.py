@@ -235,36 +235,22 @@ async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None
             pass
         return
 
-    # ── Logic Change: Collisions ──────────────────────────────────────────
-    # If it's a manual task approval (task_id is set), we only care if THAT task is done.
-    # If it's a contract approval, we check the whole contract.
-    if task_id:
-        # Check specific task from the DB (refresh to be sure)
-        task_ref = await repo.get_task(session, task_id)
-        if task_ref.status != TaskStatus.todo:
-            try:
-                await callback.answer("Already processed! ✅", show_alert=True)
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except TelegramBadRequest:
-                pass
-            return
-    elif contract.status != ContractStatus.draft:
-        try:
-            await callback.answer("Already processed.", show_alert=True)
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        return
-
-    # ── 1. Activate ───────────────────────────────────────────────────────
+    # ── 1. Idempotent Activation ──────────────────────────────────────────
+    # We update the contract and tasks regardless of current status, 
+    # skipping only tasks that are already 'done'.
+    
     await repo.activate_contract(session, contract.id)
 
-    # If task_id is set, only mark THAT task. Otherwise, all tasks.
+    # If task_id is set (manual task), we only update THAT specific task.
     if task_id:
-        await repo.update_task_status(session, task_id, TaskStatus.in_progress)
+        target_task = await repo.get_task(session, task_id)
+        if target_task and target_task.status != TaskStatus.done:
+            await repo.update_task_status(session, task_id, TaskStatus.in_progress)
     else:
+        # Otherwise, update all tasks that aren't already completed.
         for t in contract.tasks:
-            await repo.update_task_status(session, t.id, TaskStatus.in_progress)
+            if t.status != TaskStatus.done:
+                await repo.update_task_status(session, t.id, TaskStatus.in_progress)
 
     await session.commit()
     await session.refresh(contract)
