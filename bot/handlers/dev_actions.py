@@ -281,7 +281,9 @@ async def handle_approve(callback: CallbackQuery, session: AsyncSession) -> None
                 await repo.update_task_status(session, t.id, TaskStatus.in_progress)
 
     await session.commit()
-    await session.refresh(contract)
+    # Explicitly refresh identifying both attributes and relationships 
+    # to avoid lazy-load errors in async context.
+    await session.refresh(contract, attribute_names=["tasks", "user"])
 
     # ── 2. Immediate Broadcast to team chat (Refactored) ───────────────────
     await send_team_notification(bot, contract)
