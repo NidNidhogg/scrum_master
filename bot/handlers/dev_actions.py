@@ -96,17 +96,45 @@ async def send_team_notification(bot, contract: DailyContract) -> None:
             f"✅ {hbold(dev_name)} accepted a new task:\n"
             f"  • {hitalic(task_desc)}"
         )
+        try:
+            await bot.send_message(TEAM_CHAT_ID, _safe_truncate(team_text), parse_mode="HTML")
+        except Exception:
+            logger.exception("Failed to send team notification for contract %s", contract.id)
     else:
-        task_lines = "\n".join(f"  • {hitalic(t.description)}" for t in contract.tasks)
-        team_text = (
-            f"✅ {hbold(dev_name)} approved their daily plan:\n"
-            f"{task_lines}"
-        )
+        # Build the header line separately so the accordion helpers can re-use it.
+        header = f"✅ {hbold(dev_name)} approved their daily plan:"
+        tasks = list(contract.tasks)
 
-    try:
-        await bot.send_message(TEAM_CHAT_ID, team_text, parse_mode="HTML")
-    except Exception:
-        logger.exception("Failed to send team notification for contract %s", contract.id)
+        try:
+            if len(tasks) <= _ACCORDION_THRESHOLD:
+                # Short list – show everything inline, no toggle needed.
+                task_lines = "\n".join(f"  • {hitalic(t.description)}" for t in tasks)
+                team_text = f"{header}\n{task_lines}"
+                await bot.send_message(
+                    TEAM_CHAT_ID,
+                    _safe_truncate(team_text),
+                    parse_mode="HTML",
+                )
+            else:
+                # Long list – show first N tasks + expand button (reuses close-task accordion).
+                hidden_count = len(tasks) - _ACCORDION_THRESHOLD
+                visible_lines = "\n".join(
+                    f"  • {hitalic(t.description)}" for t in tasks[:_ACCORDION_THRESHOLD]
+                )
+                team_text = f"{header}\n\nRemaining tasks:\n{visible_lines}"
+                toggle_kb = _build_toggle_keyboard(
+                    contract.id,
+                    action="expand",
+                    hidden_count=hidden_count,
+                )
+                await bot.send_message(
+                    TEAM_CHAT_ID,
+                    _safe_truncate(team_text),
+                    parse_mode="HTML",
+                    reply_markup=toggle_kb,
+                )
+        except Exception:
+            logger.exception("Failed to send team notification for contract %s", contract.id)
 
 
 _TG_MAX_LEN = 4000
