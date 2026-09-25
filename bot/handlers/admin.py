@@ -366,8 +366,23 @@ async def _process_transcript(
         if user_id:
             orphan = await repo.get_contract_today(session, developer_alias=alias)
             if orphan and orphan.user_id is None:
-                orphan.user_id = user_id
-                print(f"DEBUG: absorbed orphan contract #{orphan.id} for '{alias}' -> user {user_id}")
+                existing = await repo.get_contract_today(session, user_id=user_id)
+                if existing and existing.id != orphan.id:
+                    # The user already has a resolved contract today (e.g. two
+                    # transcript names alias to the same person): merge the
+                    # orphan's tasks into it — two same-user contracts would
+                    # bypass the per-contract dedup keys and duplicate tasks.
+                    for orphan_task in orphan.tasks:
+                        orphan_task.contract_id = existing.id
+                    # flush BEFORE delete — the contract's delete-orphan cascade
+                    # would otherwise wipe the tasks we just moved over
+                    await session.flush()
+                    await session.delete(orphan)
+                    session.expire(existing, ["tasks"])
+                    print(f"DEBUG: merged orphan contract #{orphan.id} tasks for '{alias}' into contract #{existing.id}")
+                else:
+                    orphan.user_id = user_id
+                    print(f"DEBUG: absorbed orphan contract #{orphan.id} for '{alias}' -> user {user_id}")
 
         # Get/Create ONE contract for this developer
         contract, _ = await repo.get_or_create_contract(

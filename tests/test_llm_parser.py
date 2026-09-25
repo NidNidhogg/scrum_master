@@ -63,3 +63,57 @@ async def test_successful_parsing_and_db_injection(db_session):
     args, kwargs = status_msg.edit_text.call_args
     header_text = args[0].lower()
     assert any(x in header_text for x in ["draft daily plans", "планы на сегодня", "today’s drafts"])
+
+
+@pytest.mark.asyncio
+async def test_same_user_alias_merges_orphan(db_session):
+    """Regression: two transcript names aliased to the SAME user must merge
+    into one contract — an absorbed orphan must not duplicate tasks."""
+    dev, _ = await repo.get_or_create_user(
+        db_session, tg_id=201, username="dima", full_name="Dmitriy Test",
+    )
+    await repo.upsert_alias(db_session, dev.id, "дима")
+    await db_session.commit()
+
+    mock_parsed = BatchCreateContractsInput(
+        meeting_context="Standup",
+        tasks=[
+            TaskInput(developer_alias="Дима", description="Task for dima"),
+            TaskInput(developer_alias="Алиса", description="Task for alisa"),
+        ],
+    )
+    status_msg = AsyncMock()
+
+    with patch("bot.handlers.admin.agent.parse_transcript", new_callable=AsyncMock) as mp:
+        mp.return_value = mock_parsed
+        await _process_transcript("t", db_session, status_msg)
+
+    # First parse: resolved Дима + unresolved Алиса orphan
+    res = await db_session.execute(
+        select(DailyContract).where(DailyContract.target_date == date.today())
+    )
+    contracts = res.scalars().all()
+    assert len(contracts) == 2
+    orphan = next(c for c in contracts if c.user_id is None)
+    assert orphan.developer_alias == "Алиса"
+
+    # Lead links Алиса to the SAME user, then re-parses the transcript
+    await repo.upsert_alias(db_session, dev.id, "алиса")
+    await db_session.commit()
+    with patch("bot.handlers.admin.agent.parse_transcript", new_callable=AsyncMock) as mp:
+        mp.return_value = mock_parsed
+        await _process_transcript("t", db_session, AsyncMock())
+
+    # Exactly one contract for the user, holding both tasks — no duplicates
+    res = await db_session.execute(
+        select(DailyContract)
+        .where(DailyContract.target_date == date.today())
+        .options(selectinload(DailyContract.tasks))
+    )
+    contracts = res.scalars().all()
+    assert len(contracts) == 1
+    contract = contracts[0]
+    assert contract.user_id == dev.id
+    assert len(contract.tasks) == 2
+    descs = {t.description for t in contract.tasks}
+    assert descs == {"Task for dima", "Task for alisa"}
