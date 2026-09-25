@@ -22,14 +22,13 @@
         <string>{{REPO_DIR}}</string>
     </dict>
 
-    <!-- Start at login; restart if the process dies -->
+    <!-- Start at login; restart whenever the process dies.
+         (SuccessfulExit=false alone misses graceful exits — the bot
+         shuts down cleanly on SIGTERM, which counts as success) -->
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
 
     <!-- Don't hot-restart faster than every 10s on repeated crashes -->
     <key>ThrottleInterval</key>
