@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from bot.handlers import admin, dev_actions
 from bot.middlewares.db_session import DbSessionMiddleware
 from db.database import init_db
-from worker.scheduler import create_scheduler
+from worker.scheduler import create_scheduler, sla_monitor
 
 load_dotenv()
 logging.basicConfig(
@@ -63,6 +63,14 @@ async def main() -> None:
     scheduler = create_scheduler(bot)
     scheduler.start()
     logger.info("Scheduler started with %d jobs.", len(scheduler.get_jobs()))
+
+    # On-boot reconciliation: the bot may have been down/asleep through
+    # cron ticks — re-check SLA overdue contracts right now instead of
+    # waiting for the next hourly run.
+    try:
+        await sla_monitor(bot)
+    except Exception:
+        logger.exception("Boot-time SLA reconciliation failed (non-fatal)")
 
     # ── Start polling ──────────────────────────
     logger.info("Bot is running. Press Ctrl+C to stop.")

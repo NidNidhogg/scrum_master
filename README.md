@@ -20,7 +20,10 @@ The system is built on a modern, asynchronous Python stack optimized for reliabi
 
 *   **Automated Transcript Parsing & Task Extraction:** Uses Google Gemini to scan raw meeting notes or transcripts, identifying assignees and work items with surgical precision.
 *   **Persistent Backlog:** Automatically carries over unfinished tasks from previous days, injecting them into the new daily context to ensure no work item is ever forgotten.
-*   **Missing Persons Radar (Automated Reminders):** A built-in cron service that monitors task activity and sends automated nudges to developers who haven't updated their status in 4+ working hours.
+*   **Missing Persons Radar (Automated Reminders):** A built-in cron service that monitors task activity and sends automated nudges to developers who haven't updated their status in 4+ working hours — repeated every 4h while idle, then escalated to the lead; unresolved contracts alert the lead instead of silently skipping.
+*   **Scored Identity Resolution:** Transcript names resolve by score (exact alias > full name > username > word-token); ambiguous or substring-only matches never guess — Send-to-Team is blocked until the lead fixes them via `/alias`.
+*   **Team Roster Config:** Per-team facts (e.g., two people sharing a first name) live in `config/team_roster.json` and are injected into the parser prompt — not hardcoded in the prompt itself.
+*   **Extraction Evals:** Golden transcript cases in `evals/cases/` score assignee accuracy and verbatim carry-over wording through the real Gemini parser (`PYTHONPATH=. .venv/bin/python evals/run_evals.py`) — regression check before any prompt change.
 *   **Idempotent UI Workflows:** Resilient Telegram inline keyboards designed to prevent double-click collisions, UI loops, and database duplication.
 
 ---
@@ -60,6 +63,20 @@ The bot immediately resolves the developer and initiates a "Manual Handshake" fl
 *   🧪 **[Local Setup & Testing (TESTING.md)](TESTING.md)** — Step-by-step guide to installation, environment variables, and running the test suite.
 
 ---
+
+### Deployment: auto-start on macOS (launchd)
+
+To keep the bot running on a laptop — start at login, restart on crash,
+and resume polling when the lid opens — install the bundled LaunchAgent:
+
+```bash
+./deploy/install_launchagent.sh    # renders + loads ~/Library/LaunchAgents/com.scrummaster.bot.plist
+```
+
+Requires `.venv` and `.env` in the repo. Logs land in `logs/bot.{out,err}.log`;
+`./deploy/uninstall_launchagent.sh` removes it. The bot's own resilience
+already covers the sleep gap: on-boot SLA reconciliation, `misfire_grace_time`
+on the cron jobs, and aiogram polling picking up missed updates.
 
 ## 🏁 Quick Start
 

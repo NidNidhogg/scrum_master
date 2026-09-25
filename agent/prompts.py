@@ -4,15 +4,68 @@ Keep prompt logic here so core.py stays thin.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import List
 
 from db.models import DailyContract, Task
 
 # ──────────────────────────────────────────────
+# Team roster (PROFILE data, not ENGINE) — config/team_roster.json
+# ──────────────────────────────────────────────
+
+_ROSTER_PATH = Path(__file__).resolve().parent.parent / "config" / "team_roster.json"
+
+
+def _load_roster() -> list:
+    try:
+        return json.loads(_ROSTER_PATH.read_text(encoding="utf-8")).get("people", [])
+    except Exception:
+        return []
+
+
+def _first_names(people: list) -> dict:
+    """Group roster entries by their first-name token."""
+    groups: dict = {}
+    for p in people:
+        first = (p.get("name") or "").split()[0].lower() if p.get("name") else ""
+        if first:
+            groups.setdefault(first, []).append(p)
+    return groups
+
+
+def _name_disambiguation_section() -> str:
+    """
+    Generate the NAME DISAMBIGUATION block from the roster config.
+    Only first names shared by >1 person get a section — no team facts
+    are baked into the prompt itself; they come from config.
+    """
+    groups = _first_names(_load_roster())
+    parts: List[str] = []
+    for first, members in groups.items():
+        if len(members) < 2:
+            continue
+        lines = [
+            f"NAME DISAMBIGUATION — MULTIPLE PEOPLE NAMED '{first.upper()}' (CRITICAL RULE):",
+            f"There are exactly {len(members)} people whose first name is '{first}'. "
+            f"You MUST distinguish them by context. NEVER output just \"{first}\" — "
+            f"always use the full disambiguated form below.",
+            "",
+        ]
+        for i, m in enumerate(members, 1):
+            lines.append(f"  {i}. {m['name']} — {m.get('role', '')}")
+            lines.append(f"     • Signals: {m.get('signals', '')}")
+            lines.append(f"     • Assign when: {m.get('rule', '')}")
+            lines.append("")
+        parts.append("\n".join(lines))
+    return "\n".join(parts)
+
+
+# ──────────────────────────────────────────────
 # Flow 1 – Ingestion
 # ──────────────────────────────────────────────
 
-INGESTION_SYSTEM = """\
+_INGESTION_BASE = """\
 You are a highly capable AI Scrum Master with advanced reasoning density.
 Your primary objective is to parse meeting transcripts into structured task contracts.
 
@@ -51,28 +104,9 @@ Core Competency: Entity Resolution & Contextual Extraction
 - Leverage context clues to distinguish between similar names.
 - Map discussion topics to specific work items (description).
 - Identify 'meeting_context' (1-3 sentences) covering the team focus.
-
-NAME DISAMBIGUATION — THE TWO DMITRYS (CRITICAL RULE):
-There are exactly two people named Дмитрий in this team. You MUST distinguish them by context.
-NEVER output just "Дмитрий" or "Dmitry" — always use the full disambiguated form below.
-
-  1. Дмитрий Б. — Lead / Process Manager
-     • Role signals: coordinates the meeting, asks others for updates, summarizes
-       how the team works, manages the process flow, monitors deadlines.
-     • Rule: if the task is about HOW THE TEAM WORKS (process, coordination,
-       communication, ceremonies, workflow improvements) → assignee = "Дмитрий Б."
-
-  2. Дмитрий С. — Tech & Business Director
-     • Role signals: makes strategic decisions, defines business logic, drives
-       architecture choices, implements deep technical features hands-on,
-       discusses product value and business outcomes.
-     • Rule: if the task is about WHAT/HOW TO BUILD & BUSINESS VALUE (features,
-       architecture, technical implementation, business requirements) → assignee = "Дмитрий С."
-
-  Decision tree when you see "Дмитрий" or "Dmitry" in the transcript:
-    → Is the context about process management / team coordination? → "Дмитрий Б."
-    → Is the context about technical implementation / business decisions? → "Дмитрий С."
-    → Still ambiguous? Default to "Дмитрий С." (tech dir is more likely to have tasks).
+- Always output the FULL name of a person as it appears in the transcript
+  (e.g. 'Дмитрий Б.', not just 'Дмитрий'); bare first names that match
+  several people are rejected downstream.
 
 COMPREHENSIVE EXTRACTION & AGGREGATION RULE: You MUST extract EVERY SINGLE task mentioned in the transcript. Scan the text line-by-line. If a user is mentioned on multiple different lines (e.g., first in a joint task, and later in individual tasks), you MUST APPEND every new task to their consolidated list. DO NOT overwrite or drop tasks. You must act as an exhaustive parser.
 
@@ -82,6 +116,18 @@ Operational Rules:
 3. If a name is ambiguous, use the most common alias found in the text.
 4. Total extraction accuracy is your priority.
 """
+
+
+def ingestion_system() -> str:
+    """INGESTION_SYSTEM + roster-driven disambiguation (PROFILE injected)."""
+    section = _name_disambiguation_section()
+    if not section:
+        return _INGESTION_BASE
+    return f"{_INGESTION_BASE}\n{section}"
+
+
+# Backward-compat constant (callers prefer ingestion_system()).
+INGESTION_SYSTEM = ingestion_system()
 
 
 def ingestion_user_prompt(raw_transcript: str, existing_backlog: str = "") -> str:

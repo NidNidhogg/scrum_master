@@ -57,11 +57,19 @@ async def missing_persons_radar(bot) -> None:
 # Job 2 – SLA Monitor (Every hour during working hours)
 # ──────────────────────────────────────────────
 
+SLA_THRESHOLD_HOURS = 4      # first ping after this much idle time
+SLA_REPEAT_HOURS = 4         # re-ping every window while still idle
+SLA_MAX_PINGS = 2            # after this many dev pings, escalate to lead
+
+
 async def sla_monitor(bot) -> None:
     logger.info("[SLA] Running SLA monitor…")
     async with AsyncSessionLocal() as session:
-        # threshold_hours=4 per requirements
-        overdue = await repo.get_overdue_active_contracts(session, threshold_hours=4)
+        overdue = await repo.get_overdue_active_contracts(
+            session,
+            threshold_hours=SLA_THRESHOLD_HOURS,
+            repeat_after_hours=SLA_REPEAT_HOURS,
+        )
         if not overdue:
             logger.info("[SLA] No idle users found.")
             return
@@ -69,7 +77,21 @@ async def sla_monitor(bot) -> None:
         for contract in overdue:
             user = contract.user
             if not user:
-                logger.warning("[SLA] Contract %s has no linked user – skipping.", contract.id)
+                # Unresolved names must not degrade silently — pings can
+                # never reach them, so the lead hears about it instead.
+                logger.warning(
+                    "[SLA] Contract %s (%s) has no linked user – alerting lead.",
+                    contract.id, contract.developer_alias,
+                )
+                if LEAD_TG_ID:
+                    await bot.send_message(
+                        LEAD_TG_ID,
+                        f"🚨 SLA: contract #{contract.id} "
+                        f"({contract.developer_alias or 'unknown'}) has no linked "
+                        f"user — SLA pings cannot reach them. Resolve via /alias.",
+                    )
+                await repo.mark_sla_ping_sent(session, contract.id)
+                await session.commit()
                 continue
 
             # Resolve the chat to ping: prefer explicit notification_chat_id, fall back to tg_id.
@@ -84,12 +106,33 @@ async def sla_monitor(bot) -> None:
             # Check if there are still unfinished tasks
             has_pending = any(t.status.value != "done" for t in contract.tasks)
             if not has_pending:
-                logger.info("[SLA] Contract %s all tasks done – skipping ping.", contract.id)
+                logger.info("[SLA] Contract %s all tasks done – closing monitor.", contract.id)
+                await repo.mark_sla_ping_sent(session, contract.id)
+                await session.commit()
                 continue
 
             name = user.full_name or user.username or "dev"
+            pings_so_far = contract.sla_ping_count or 0
+
+            if pings_so_far >= SLA_MAX_PINGS:
+                # Dev was pinged repeatedly and stayed idle → escalate to lead.
+                if LEAD_TG_ID:
+                    open_descs = ", ".join(
+                        t.description[:60] for t in contract.tasks
+                        if t.status.value != "done"
+                    )
+                    await bot.send_message(
+                        LEAD_TG_ID,
+                        f"🚨 SLA escalation: {name} idle after "
+                        f"{pings_so_far} pings. Open: {open_descs}",
+                    )
+                await repo.mark_sla_ping_sent(session, contract.id)
+                await session.commit()
+                logger.info("[SLA] Escalated contract %s to lead.", contract.id)
+                continue
+
             ping_text = (
-                f"Hey {name}, it's been 4 hours since the last update. "
+                f"Hey {name}, it's been a while since the last update. "
                 f"Any progress on your tasks? Let me know if you're stuck! 🤖"
             )
 
@@ -104,9 +147,12 @@ async def sla_monitor(bot) -> None:
                 continue  # do NOT mark as sent; let the next hourly run retry
 
             # Only mark & commit after a confirmed successful send.
-            await repo.mark_sla_ping_sent(session, contract.id)
+            count = await repo.record_sla_ping(session, contract.id)
             await session.commit()
-            logger.info("[SLA] Pinged user %s via chat %s", user.tg_id, chat_id)
+            logger.info(
+                "[SLA] Pinged user %s via chat %s (ping #%d)",
+                user.tg_id, chat_id, count,
+            )
 
 
 # ──────────────────────────────────────────────
@@ -167,12 +213,17 @@ async def evening_synthesis(bot) -> None:
 def create_scheduler(bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=TZ)
 
+    # misfire_grace_time: a tick missed while the process was down fires
+    # late (up to 1h) instead of being dropped — covers laptop suspend.
+    grace = 3600
+
     scheduler.add_job(
         missing_persons_radar,
         CronTrigger(hour=11, minute=0, timezone=TZ),
         kwargs={"bot": bot},
         id="missing_persons_radar",
         replace_existing=True,
+        misfire_grace_time=grace,
     )
 
     scheduler.add_job(
@@ -182,6 +233,7 @@ def create_scheduler(bot) -> AsyncIOScheduler:
         kwargs={"bot": bot},
         id="sla_monitor",
         replace_existing=True,
+        misfire_grace_time=grace,
     )
 
     scheduler.add_job(
@@ -190,6 +242,7 @@ def create_scheduler(bot) -> AsyncIOScheduler:
         kwargs={"bot": bot},
         id="evening_synthesis",
         replace_existing=True,
+        misfire_grace_time=grace,
     )
 
     return scheduler

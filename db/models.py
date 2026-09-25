@@ -118,7 +118,12 @@ class DailyContract(Base):
 
     # SLA tracking
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # sla_ping_sent is the TERMINAL flag: set when monitoring is closed for
+    # this contract (dev escalated to lead). Repeat pings track count/time
+    # separately so a dev gets re-pinged every SLA_REPEAT_HOURS, not once.
     sla_ping_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sla_ping_count: Mapped[int] = mapped_column(default=0, nullable=False)
+    sla_ping_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

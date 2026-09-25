@@ -1,0 +1,16 @@
+{
+  "people": [
+    {
+      "name": "Дмитрий Б.",
+      "role": "Lead / Process Manager",
+      "signals": "coordinates the meeting, asks others for updates, summarizes how the team works, manages the process flow, monitors deadlines",
+      "rule": "the task is about HOW THE TEAM WORKS (process, coordination, communication, ceremonies, workflow improvements)"
+    },
+    {
+      "name": "Дмитрий С.",
+      "role": "Tech & Business Director",
+      "signals": "makes strategic decisions, defines business logic, drives architecture choices, implements deep technical features hands-on, discusses product value and business outcomes",
+      "rule": "the task is about WHAT/HOW TO BUILD & BUSINESS VALUE (features, architecture, technical implementation, business requirements)"
+    }
+  ]
+}
