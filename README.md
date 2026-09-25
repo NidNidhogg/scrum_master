@@ -64,6 +64,20 @@ The bot immediately resolves the developer and initiates a "Manual Handshake" fl
 
 ---
 
+### Deployment: auto-start on macOS (launchd)
+
+To keep the bot running on a laptop — start at login, restart on crash,
+and resume polling when the lid opens — install the bundled LaunchAgent:
+
+```bash
+./deploy/install_launchagent.sh    # renders + loads ~/Library/LaunchAgents/com.scrummaster.bot.plist
+```
+
+Requires `.venv` and `.env` in the repo. Logs land in `logs/bot.{out,err}.log`;
+`./deploy/uninstall_launchagent.sh` removes it. The bot's own resilience
+already covers the sleep gap: on-boot SLA reconciliation, `misfire_grace_time`
+on the cron jobs, and aiogram polling picking up missed updates.
+
 ## 🏁 Quick Start
 
 To get the bot running locally for development or testing:
