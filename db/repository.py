@@ -320,13 +320,22 @@ async def get_contracts_for_date(
 # ──────────────────────────────────────────────
 
 async def get_overdue_active_contracts(
-    session: AsyncSession, threshold_hours: int = 4
+    session: AsyncSession,
+    threshold_hours: int = 4,
+    repeat_after_hours: int = 4,
 ) -> Sequence[DailyContract]:
     """
-    Returns active contracts where user hasn't approved or finished a task for > thresh.
-    Priority: Max(started_at, Max(task.updated_at for done tasks))
+    Active contracts idle for > threshold_hours, due for a ping.
+
+    Repeat logic: sla_ping_sent is the TERMINAL flag (set on lead
+    escalation), so it stays in the filter; a contract re-enters the
+    result once sla_ping_at ages past repeat_after_hours — the dev is
+    re-pinged every window instead of once per day.
     """
-    # 1. Fetch all active contracts for today where ping hasn't been sent yet
+    now = datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(hours=threshold_hours)
+    repeat_cutoff = now - timedelta(hours=repeat_after_hours)
+
     result = await session.execute(
         select(DailyContract)
         .where(
@@ -336,34 +345,46 @@ async def get_overdue_active_contracts(
         .options(selectinload(DailyContract.tasks), selectinload(DailyContract.user))
     )
     all_active = result.scalars().all()
-    
-    now = datetime.now(tz=timezone.utc)
-    cutoff = now - timedelta(hours=threshold_hours)
+
     overdue = []
-    
     for c in all_active:
-        # 2. Base activity – ensure UTC awareness (SQLite sometimes returns naive)
+        # Not yet due for a (repeat) ping
+        if c.sla_ping_at is not None:
+            ping_at = c.sla_ping_at
+            if ping_at.tzinfo is None:
+                ping_at = ping_at.replace(tzinfo=timezone.utc)
+            if ping_at > repeat_cutoff:
+                continue
+
         last_activity = c.started_at
         if last_activity and last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
-        
-        # 3. Check if any task was finished AFTER approval
+
         for t in c.tasks:
             if t.status == TaskStatus.done and t.updated_at:
                 t_upd = t.updated_at
                 if t_upd.tzinfo is None:
                     t_upd = t_upd.replace(tzinfo=timezone.utc)
-                    
                 if last_activity is None or t_upd > last_activity:
                     last_activity = t_upd
-        
+
         if last_activity and last_activity <= cutoff:
             overdue.append(c)
-            
+
     return overdue
 
 
+async def record_sla_ping(session: AsyncSession, contract_id: int) -> int:
+    """Increment the ping counter and stamp the time. Returns new count."""
+    contract = await session.get(DailyContract, contract_id)
+    contract.sla_ping_count = (contract.sla_ping_count or 0) + 1
+    contract.sla_ping_at = datetime.now(tz=timezone.utc)
+    await session.flush()
+    return contract.sla_ping_count
+
+
 async def mark_sla_ping_sent(session: AsyncSession, contract_id: int) -> None:
+    """Terminal flag — closes SLA monitoring for the contract."""
     await session.execute(
         update(DailyContract)
         .where(DailyContract.id == contract_id)

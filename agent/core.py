@@ -81,7 +81,7 @@ class AgentCore:
             # Re-initialize the model to ensure NO state/history carryover from previous calls.
             # We explicitly do NOT use model.start_chat() to maintain statelessness.
             model = self._get_model(
-                system_instruction=prompts.INGESTION_SYSTEM,
+                system_instruction=prompts.ingestion_system(),
                 tools=get_gemini_tools()
             )
 

@@ -15,19 +15,17 @@ def event_loop():
     yield loop
     loop.close()
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 async def test_engine():
-    """Create a fresh engine for the test session."""
+    """Fresh in-memory engine per test — rows committed inside a test
+    must not leak into the next one (they did under a session-scoped DB)."""
     engine = create_async_engine(TEST_DB_URL, echo=False)
-    
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
+
     yield engine
-    
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        
+
     await engine.dispose()
 
 @pytest.fixture

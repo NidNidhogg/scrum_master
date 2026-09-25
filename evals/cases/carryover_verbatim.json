@@ -1,0 +1,11 @@
+{
+  "name": "carryover_verbatim",
+  "comment": "Prod bug: carried-over backlog tasks must keep verbatim wording — any mutation creates duplicates that dedup cannot see.",
+  "transcript": "Стендап. Алексей продолжает задачу с логированием — сегодня добьёт. Плюс новое: Алексей добавит метрики в дашборд.",
+  "existing_backlog": "User: Алексей\n- Добавить структурное логирование в ingestion-сервис",
+  "expected_tasks": [
+    {"developer_alias": "Алексей", "description_exact": "Добавить структурное логирование в ingestion-сервис"},
+    {"developer_alias": "Алексей", "description_contains": "метрик"}
+  ],
+  "forbidden_aliases": []
+}

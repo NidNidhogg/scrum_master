@@ -1,0 +1,13 @@
+{
+  "name": "ambiguous_first_name",
+  "comment": "Prod bug: bare first name must resolve by role context to the disambiguated person, never to a bare 'дмитрий'.",
+  "transcript": "Стендап. Дмитрий Б.: итак, по процессу — Дмитрию нужно провести ретро спринта в пятницу и обновить борду команды. По фичам: Дмитрий С. должен закончить интеграцию платёжного шлюза и задеплоить новый endpoint. Иванов: ревью PR по авторизации.",
+  "existing_backlog": "",
+  "expected_tasks": [
+    {"developer_alias": "Дмитрий Б.", "description_contains": "ретро"},
+    {"developer_alias": "Дмитрий Б.", "description_contains": "борд"},
+    {"developer_alias": "Дмитрий С.", "description_contains": "плат"},
+    {"developer_alias": "Дмитрий С.", "description_contains": "endpoint"}
+  ],
+  "forbidden_aliases": ["дмитрий"]
+}

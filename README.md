@@ -20,7 +20,10 @@ The system is built on a modern, asynchronous Python stack optimized for reliabi
 
 *   **Automated Transcript Parsing & Task Extraction:** Uses Google Gemini to scan raw meeting notes or transcripts, identifying assignees and work items with surgical precision.
 *   **Persistent Backlog:** Automatically carries over unfinished tasks from previous days, injecting them into the new daily context to ensure no work item is ever forgotten.
-*   **Missing Persons Radar (Automated Reminders):** A built-in cron service that monitors task activity and sends automated nudges to developers who haven't updated their status in 4+ working hours.
+*   **Missing Persons Radar (Automated Reminders):** A built-in cron service that monitors task activity and sends automated nudges to developers who haven't updated their status in 4+ working hours — repeated every 4h while idle, then escalated to the lead; unresolved contracts alert the lead instead of silently skipping.
+*   **Scored Identity Resolution:** Transcript names resolve by score (exact alias > full name > username > word-token); ambiguous or substring-only matches never guess — Send-to-Team is blocked until the lead fixes them via `/alias`.
+*   **Team Roster Config:** Per-team facts (e.g., two people sharing a first name) live in `config/team_roster.json` and are injected into the parser prompt — not hardcoded in the prompt itself.
+*   **Extraction Evals:** Golden transcript cases in `evals/cases/` score assignee accuracy and verbatim carry-over wording through the real Gemini parser (`PYTHONPATH=. .venv/bin/python evals/run_evals.py`) — regression check before any prompt change.
 *   **Idempotent UI Workflows:** Resilient Telegram inline keyboards designed to prevent double-click collisions, UI loops, and database duplication.
 
 ---

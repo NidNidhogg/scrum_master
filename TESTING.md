@@ -24,10 +24,12 @@ PYTHONPATH=. .venv/bin/pytest
 ### 3. The Testing Pyramid
 Our suite is organized into three distinct levels of validation:
 
-*   **`conftest.py`**: The foundation. Contains shared async fixtures for the database engine, session management, and test environment setup.
+*   **`conftest.py`**: The foundation. Contains shared async fixtures; each test gets a **fresh in-memory engine** so committed rows cannot leak between tests.
 *   **Level 1: `tests/test_repository.py`**: Verifies core Data Access Object (DAO) logic. Focuses on CRUD operations, identity resolution, and **fuzzy duplicate prevention** (ensuring the same task isn't added twice to a contract).
 *   **Level 2: `tests/test_business_logic.py`**: Validates the **Idempotent State Machine**. Tests simulate Telegram callbacks to ensure that operations like "Approve" or "Activate" can be called multiple times without causing duplicate notifications or invalid state transitions.
 *   **Level 3: `tests/test_llm_parser.py`**: Focuses on the LLM parsing logic. Uses `unittest.mock` to simulate Gemini API responses, allowing us to verify transcript extraction accuracy and backlog merging without making real network calls.
+*   **Level 4: `tests/test_sla_repeat.py`**: SLA monitor windows — first ping on overdue, repeat-window suppression and re-entry, terminal escalation flag, and recent-activity exemption.
+*   **Evals: `evals/`**: Two-layer quality contour for the LLM extraction itself. `evals/test_name_resolution.py` runs offline (scored name matching — substring collisions like "Иван"→"Иванов" and bare shared first names must not guess). `evals/run_evals.py` feeds golden transcripts (`evals/cases/*.json`) through the **real** Gemini parser and scores assignee accuracy, verbatim carry-over wording, and forbidden aliases — regression check before any prompt change (needs `GEMINI_API_KEY`).
 
 ### 4. Developer Rule
 > [!IMPORTANT]

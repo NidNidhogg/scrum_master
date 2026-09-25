@@ -1,0 +1,12 @@
+{
+  "name": "delegation_not_speaker",
+  "comment": "Delegation rule: 'Алексей, сделай X' said by the lead assigns to Алексей, not to the speaker.",
+  "transcript": "Дмитрий Б.: Алексей, пожалуйста почини падающий импорт в worker и посмотри почему очередь копится. Мария, тебе — макет лендинга к вечеру. У меня самого — синк с заказчиком в 15:00.",
+  "existing_backlog": "",
+  "expected_tasks": [
+    {"developer_alias": "Алексей", "description_contains": "импорт"},
+    {"developer_alias": "Мария", "description_contains": "макет"},
+    {"developer_alias": "Дмитрий Б.", "description_contains": "синк"}
+  ],
+  "forbidden_aliases": []
+}

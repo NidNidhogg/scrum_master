@@ -13,6 +13,7 @@ import os
 from datetime import date
 from html import escape
 from io import BytesIO
+from typing import Optional, Sequence
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
@@ -30,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent.core import agent
 from bot.states import AdminStates
 from db import repository as repo
-from db.models import UserRole
+from db.models import User, UserRole
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -174,42 +175,103 @@ def _format_drafts_for_editing(contracts: list) -> str:
 # Ingestion Logic
 # ──────────────────────────────────────────────
 
+def _normalize_name(text: str) -> str:
+    """Lowercase, strip trailing punctuation, collapse whitespace."""
+    import re as _re
+    cleaned = _re.sub(r'[\s:.,]+$', '', text.strip().lower())
+    return _re.sub(r'\s+', ' ', cleaned)
+
+
+def _name_tokens(text: str) -> set:
+    return {t for t in _normalize_name(text).split(' ') if t}
+
+
+def score_name_match(
+    name_query: str,
+    *,
+    aliases: Sequence[str] = (),
+    full_name: Optional[str] = None,
+    username: Optional[str] = None,
+) -> int:
+    """
+    Scored name resolution (pure function, unit-testable).
+
+    Substring guessing is what silently picked the wrong person in prod
+    ("Иван" matched "Иванов") — matching is now word-exact only:
+      100 alias exact   — lead-registered nicknames are strongest evidence
+       95 full_name exact
+       90 username exact
+       70 query is a full token of full_name ("дмитрий" in "дмитрий с.")
+       60 full-token overlap with an alias
+        0 no match
+    """
+    q = _normalize_name(name_query)
+    q_tokens = set(q.split()) - {''}
+    if not q:
+        return 0
+
+    for alias in aliases:
+        a = _normalize_name(alias)
+        if a and a == q:
+            return 100
+    fn = _normalize_name(full_name or '')
+    if fn and fn == q:
+        return 95
+    un = _normalize_name(username or '')
+    if un and un == q:
+        return 90
+    if fn and q in _name_tokens(full_name or ''):
+        return 70
+    for alias in aliases:
+        a_tokens = _name_tokens(alias)
+        if a_tokens and (q_tokens <= a_tokens or a_tokens <= q_tokens):
+            return 60
+    return 0
+
+
 async def _resolve_user_by_name(
     session: AsyncSession,
     name_query: str,
-) -> Optional[repo.User]:
+) -> tuple[Optional[User], list[str]]:
     """
-    Smart Match helper: Aliases -> FullName -> Username.
+    -> (user | None, ambiguous_labels).
+    Returns the unique top-scored user; ties resolve to None + labels
+    so callers can flag ambiguity instead of guessing.
     """
-    import re as _re
-    # Clean query: strip whitespace and trailing punctuation (:, .)
-    clean_query = _re.sub(r'[\s:.,]+$', '', name_query.strip())
-    query_key = clean_query.lower()
-    
-    # Load all for matching
     all_aliases = await repo.get_all_aliases(session)
     all_users = await repo.get_all_users(session)
-    
-    # Pass 1: exact alias match
-    for alias_obj in all_aliases:
-        db_alias = alias_obj.alias.strip().lower()
-        if db_alias == query_key or db_alias in query_key or query_key in db_alias:
-            print(f"DEBUG: SmartMatch alias '{alias_obj.alias}' -> user {alias_obj.user.tg_id}")
-            return alias_obj.user
 
-    # Pass 2: full_name contains
-    for u in all_users:
-        if query_key in (u.full_name or "").strip().lower():
-            print(f"DEBUG: SmartMatch full_name '{u.full_name}' for '{clean_query}'")
-            return u
+    aliases_by_user: dict[int, list[str]] = {}
+    for al in all_aliases:
+        if al.user_id is not None:
+            aliases_by_user.setdefault(al.user_id, []).append(al.alias)
 
-    # Pass 3: username contains
+    scores: dict[int, int] = {}
+    users_by_id: dict[int, User] = {}
     for u in all_users:
-        if query_key in (u.username or "").strip().lower():
-            print(f"DEBUG: SmartMatch username '{u.username}' for '{clean_query}'")
-            return u
-            
-    return None
+        users_by_id[u.id] = u
+        s = score_name_match(
+            name_query,
+            aliases=aliases_by_user.get(u.id, []),
+            full_name=u.full_name,
+            username=u.username,
+        )
+        if s > 0:
+            scores[u.id] = max(scores.get(u.id, 0), s)
+
+    if not scores:
+        print(f"DEBUG: SmartMatch no candidates for '{name_query}'")
+        return None, []
+
+    top = max(scores.values())
+    winners = [users_by_id[uid] for uid, s in scores.items() if s == top]
+    if len(winners) > 1:
+        labels = [u.full_name or u.username or str(u.tg_id) for u in winners]
+        print(f"DEBUG: SmartMatch ambiguous '{name_query}' -> {labels}")
+        return None, labels
+
+    print(f"DEBUG: SmartMatch '{name_query}' -> {winners[0].tg_id} (score {top})")
+    return winners[0], []
 
 
 async def _process_transcript(
@@ -293,9 +355,20 @@ async def _process_transcript(
 
     # ── Part 4: Process pooled tasks per developer ─────────────────────────
     for alias, tasks in merged_tasks.items():
-        found_user = await _resolve_user_by_name(session, alias)
+        found_user, ambiguous = await _resolve_user_by_name(session, alias)
         user_id = found_user.id if found_user else None
-        
+        if ambiguous:
+            print(f"DEBUG: '{alias}' ambiguous between {ambiguous} — left unresolved for lead review.")
+
+        # Absorb an earlier unresolved contract for this alias (lead fixed
+        # it via /alias and re-ran) — otherwise the orphan blocks Send-to-Team
+        # forever while a duplicate resolved contract sits beside it.
+        if user_id:
+            orphan = await repo.get_contract_today(session, developer_alias=alias)
+            if orphan and orphan.user_id is None:
+                orphan.user_id = user_id
+                print(f"DEBUG: absorbed orphan contract #{orphan.id} for '{alias}' -> user {user_id}")
+
         # Get/Create ONE contract for this developer
         contract, _ = await repo.get_or_create_contract(
             session,
@@ -449,10 +522,17 @@ async def cmd_todo(message: Message, session: AsyncSession) -> None:
         return
 
     session.expire_all()
-    target_user = await _resolve_user_by_name(session, assignee_name)
+    target_user, ambiguous = await _resolve_user_by_name(session, assignee_name)
 
     if not target_user:
-        await message.reply(f"❌ User not found: {hcode(assignee_name)}", parse_mode="HTML")
+        if ambiguous:
+            await message.reply(
+                f"⚠️ {hcode(assignee_name)} matches several people: {escape(', '.join(ambiguous))}. "
+                f"Use a full name or /alias.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.reply(f"❌ User not found: {hcode(assignee_name)}", parse_mode="HTML")
         return
 
     # Create / get contract for today
@@ -564,7 +644,26 @@ async def handle_transcript_file(message: Message, session: AsyncSession) -> Non
 async def handle_send_to_team(callback: CallbackQuery, session: AsyncSession) -> None:
     if not _is_lead(callback.from_user.id): return
     contracts = await repo.get_contracts_for_date(session)
-    resolved = [c for c in contracts if c.status.value == "draft" and c.user_id is not None]
+    drafts = [c for c in contracts if c.status.value == "draft"]
+
+    # GUARDRAIL: never silently drop unresolved people — their SLA pings,
+    # dashboards and carry-over all degrade downstream. Fail closed and
+    # tell the lead exactly who needs an /alias.
+    unresolved = [c for c in drafts if c.user_id is None]
+    if unresolved:
+        # callback answers cap ~200 chars — keep names bounded
+        names = ", ".join(c.developer_alias or "?" for c in unresolved)[:120]
+        try:
+            await callback.answer(
+                f"⛔ Unresolved names: {names}. "
+                f"Link via /alias \"Name\" tg_id, then resend the transcript.",
+                show_alert=True,
+            )
+        except TelegramBadRequest:
+            pass
+        return
+
+    resolved = [c for c in drafts if c.user_id is not None]
     if not resolved: 
         try:
             return await callback.answer("No resolved plans.", show_alert=True)
